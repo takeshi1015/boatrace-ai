@@ -18,15 +18,15 @@ from src.backtest import (
 )
 
 JST = ZoneInfo("Asia/Tokyo")
-APP_VERSION = "v2.10"
+APP_VERSION = "v2.10.1"
 V291_CUTOFF = pd.Timestamp("2026-08-11 11:09:00")  # v2.9.1画面確認時刻を基準
 MIN_COMBO_PROB = 0.008
 MIN_EV = 1.05
 DIRECT_REFRESH_MINUTES = 30
 
-st.set_page_config(page_title="BOAT RACE AI v2.10", layout="wide")
+st.set_page_config(page_title="BOAT RACE AI v2.10.1", layout="wide")
 st.title("BOAT RACE AI 購入判断ダッシュボード")
-st.caption("v2.10：200件自動ゲート・2案提示・30分以内直前オッズ再判定・世代別成績")
+st.caption("v2.10.1：最終購入判断UI・推奨優先案・120通り確率%表示修正")
 
 now = pd.Timestamp.now(tz=JST)
 
@@ -385,32 +385,70 @@ else:
 
     for _, r in headline.head(3).iterrows():
         with st.container(border=True):
-            a,b,c,d,e = st.columns([1.1,1.1,1.1,1.2,1.5])
+            a,b,c,d,e = st.columns([1.2,1.2,1.2,1.4,1.5])
+
             if r["判断"] == "買い":
                 a.success("## 買い")
             else:
                 a.warning("## 見送り")
+
             b.markdown(f"### {r['場']} {r['R']}R")
             c.metric("締切まで", f"{r['残り分']:.0f}分")
             d.metric("オッズ更新", r["オッズ更新"])
             e.metric("取得", f"{r['取得組合せ数']}/120")
 
-            st.markdown("#### 高確率寄り")
-            x1,x2,x3,x4 = st.columns(4)
-            x1.metric("買い目", r["高確率買い目"])
-            x2.metric("AI確率", f"{r['高確率AI確率%']:.2f}%")
-            x3.metric("実オッズ", f"{r['高確率オッズ']:.1f}倍" if pd.notna(r["高確率オッズ"]) else "—")
-            x4.metric("期待値", f"{r['高確率期待値']:.2f}" if pd.notna(r["高確率期待値"]) else "—")
+            st.markdown("### 推奨2案")
+            left, right = st.columns(2)
 
-            st.markdown("#### 高期待値寄り")
-            y1,y2,y3,y4 = st.columns(4)
-            y1.metric("買い目", r["高期待値買い目"])
-            y2.metric("AI確率", f"{r['高期待値AI確率%']:.2f}%")
-            y3.metric("実オッズ", f"{r['高期待値オッズ']:.1f}倍" if pd.notna(r["高期待値オッズ"]) else "—")
-            y4.metric("期待値", f"{r['高期待値期待値']:.2f}" if pd.notna(r["高期待値期待値"]) else "—")
+            with left:
+                st.markdown("#### 高確率寄り")
+                x1,x2 = st.columns(2)
+                x1.metric("買い目", r["高確率買い目"])
+                x2.metric("AI確率", f"{r['高確率AI確率%']:.2f}%")
+                x3,x4 = st.columns(2)
+                x3.metric("実オッズ", f"{r['高確率オッズ']:.1f}倍" if pd.notna(r["高確率オッズ"]) else "—")
+                x4.metric("期待値", f"{r['高確率期待値']:.2f}" if pd.notna(r["高確率期待値"]) else "—")
+
+            with right:
+                st.markdown("#### 高期待値寄り")
+                y1,y2 = st.columns(2)
+                y1.metric("買い目", r["高期待値買い目"])
+                y2.metric("AI確率", f"{r['高期待値AI確率%']:.2f}%")
+                y3,y4 = st.columns(2)
+                y3.metric("実オッズ", f"{r['高期待値オッズ']:.1f}倍" if pd.notna(r["高期待値オッズ"]) else "—")
+                y4.metric("期待値", f"{r['高期待値期待値']:.2f}" if pd.notna(r["高期待値期待値"]) else "—")
+
+            safe_prob = float(r["高確率AI確率%"])
+            safe_ev = float(r["高確率期待値"]) if pd.notna(r["高確率期待値"]) else 0.0
+            value_prob = float(r["高期待値AI確率%"])
+            value_ev = float(r["高期待値期待値"]) if pd.notna(r["高期待値期待値"]) else 0.0
+
+            if safe_prob >= 5.0 and safe_ev >= 1.00 and value_ev < safe_ev * 1.50:
+                priority = "高確率寄り"
+                priority_combo = r["高確率買い目"]
+                priority_reason = "AI確率が高く、期待値も1.0以上のため安定性を優先"
+            elif value_ev >= max(1.50, safe_ev * 1.50):
+                priority = "高期待値寄り"
+                priority_combo = r["高期待値買い目"]
+                priority_reason = "高期待値案の期待値が高確率案を大きく上回るため"
+            elif safe_prob >= value_prob * 2.0:
+                priority = "高確率寄り"
+                priority_combo = r["高確率買い目"]
+                priority_reason = "高確率案の的中確率が高期待値案の2倍以上あるため"
+            else:
+                priority = "高期待値寄り"
+                priority_combo = r["高期待値買い目"]
+                priority_reason = "期待値優位を優先"
+
+            st.markdown("### 優先案")
+            if r["判断"] == "買い":
+                st.success(f"**優先：{priority} → {priority_combo}**  \n{priority_reason}")
+            else:
+                st.info(f"参考上の優先案：**{priority} → {priority_combo}**  \n{priority_reason}。ただし現在はゲート未合格のため見送り。")
 
             if r["残り分"] <= DIRECT_REFRESH_MINUTES:
                 st.info("締切30分以内：直前オッズを再取得して最終判定済み")
+
             st.caption("判断理由：" + r["判断理由"])
 
 # All races table
@@ -571,10 +609,22 @@ if detail_map:
                 if value_idx == safe_idx else "高期待値"
             )
 
+    detail_show = t.sort_values(
+        ["expected_value","prob"], ascending=False, na_position="last"
+    )[["区分","combo","prob_pct","odds","expected_value"]].copy()
+
+    detail_show["AI確率"] = detail_show["prob_pct"].map(
+        lambda x: f"{x:.3f}%" if pd.notna(x) else "—"
+    )
+    detail_show["実オッズ"] = pd.to_numeric(
+        detail_show["odds"], errors="coerce"
+    ).map(lambda x: f"{x:.1f}倍" if pd.notna(x) else "—")
+    detail_show["期待値"] = pd.to_numeric(
+        detail_show["expected_value"], errors="coerce"
+    ).map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
+
     st.dataframe(
-        t.sort_values(
-            ["expected_value","prob"], ascending=False, na_position="last"
-        )[["区分","combo","prob_pct","odds","expected_value"]],
+        detail_show[["区分","combo","AI確率","実オッズ","期待値"]],
         use_container_width=True,
         hide_index=True
     )
@@ -598,5 +648,5 @@ if st.button("最新結果で再学習する"):
 
 st.caption(
     "購入判断支援用です。的中・利益を保証しません。"
-    "締切30分以内は直前オッズを再取得します。"
+    "締切30分以内は直前オッズを再取得し、2案と優先案を再判定します。"
 )
