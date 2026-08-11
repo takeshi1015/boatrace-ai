@@ -13,7 +13,7 @@ JST = ZoneInfo("Asia/Tokyo")
 
 st.set_page_config(page_title="BOAT RACE AI", layout="wide")
 st.title("BOAT RACE AI 予想ダッシュボード")
-st.caption("無料版 v2.2：高速化・実データ学習・3連単確率・期待値・成績検証")
+st.caption("無料版 v2.3：公式3連単オッズ表対応・高速化・実データ学習")
 
 now = pd.Timestamp.now(tz=JST)
 st.write(f"現在時刻：{now:%Y/%m/%d %H:%M:%S}")
@@ -176,12 +176,18 @@ for _, row in pool.iterrows():
         "実オッズ": best.get("odds", np.nan),
         "期待値": best.get("expected_value", np.nan),
         "オッズ取得": bool(len(odds) > 0),
+        "取得組合せ数": int(len(odds)),
     })
 
 races = pd.DataFrame(race_rows)
 
 st.subheader("最終評価対象")
 st.dataframe(races, use_container_width=True, hide_index=True)
+
+if not races.empty:
+    ok = races[races["オッズ取得"]]
+    if not ok.empty:
+        st.success(f"実オッズ取得成功：{len(ok)}レース。最大取得組合せ数 {int(ok['取得組合せ数'].max())}/120")
 
 if not races["オッズ取得"].any():
     st.warning(
