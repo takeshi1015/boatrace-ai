@@ -147,3 +147,26 @@ def race_confidence(tri):
     p=tri['prob'].to_numpy(float)
     entropy=-(p*np.log(np.maximum(p,1e-12))).sum()
     return float(p[0]/max(entropy,1e-9))
+
+
+def selection_signals(tri):
+    """Pre-race signals used by the second-stage bet selector."""
+    if tri is None or tri.empty:
+        return {
+            'top_prob':0.0,'prob_margin':0.0,'confidence':0.0,
+            'first_lane':None,'second_lane':None,'third_lane':None,
+        }
+    x=tri.sort_values('prob',ascending=False).reset_index(drop=True)
+    top=float(x.loc[0,'prob'])
+    second=float(x.loc[1,'prob']) if len(x)>1 else 0.0
+    combo=str(x.loc[0,'combo'])
+    try:
+        a,b,c=[int(v) for v in combo.split('-')]
+    except Exception:
+        a=b=c=None
+    return {
+        'top_prob':top,
+        'prob_margin':top-second,
+        'confidence':race_confidence(x),
+        'first_lane':a,'second_lane':b,'third_lane':c,
+    }

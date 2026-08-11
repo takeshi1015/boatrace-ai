@@ -5,15 +5,18 @@ import pandas as pd
 import streamlit as st
 
 from src.data import fetch_today, flatten, historical_dataset, fetch_results_for_dates
-from src.model import fit_models, trifecta_table, race_confidence
+from src.model import fit_models, trifecta_table, race_confidence, selection_signals
 from src.odds import fetch_trifecta_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
-from src.backtest import walk_forward_backtest
+from src.backtest import (
+    generate_walk_forward_predictions, selector_walk_forward,
+    fit_current_selector, current_buy_score, summarize
+)
 
 JST=ZoneInfo("Asia/Tokyo")
 st.set_page_config(page_title="BOAT RACE AI",layout="wide")
 st.title("BOAT RACE AI 予想ダッシュボード")
-st.caption("無料版 v2.6：3着別AI・結果再取得・自動精算・オッズ再試行・時系列バックテスト")
+st.caption("無料版 v2.7：利益選別AI・二重時系列検証・実オッズ期待値")
 
 now=pd.Timestamp.now(tz=JST)
 st.write(f"現在時刻：{now:%Y/%m/%d %H:%M:%S}")
@@ -30,9 +33,18 @@ def load_models():
 def odds_cached(d,v,r):
     return fetch_trifecta_odds(d,v,r,timeout=7)
 
-@st.cache_data(ttl=21600,show_spinner="時系列バックテスト中…")
-def cached_backtest():
-    return walk_forward_backtest(load_hist(),min_train_days=35,test_days=7,max_test_days=28)
+@st.cache_data(ttl=21600,show_spinner="利益選別AIを時系列検証しています…")
+def selector_assets():
+    preds=generate_walk_forward_predictions(
+        load_hist(),min_train_days=35,test_days=7,max_test_days=42
+    )
+    selected,metrics,rules=selector_walk_forward(
+        preds,lookback_days=21,step_days=7,min_bets=80
+    )
+    current_rule,current_stats=fit_current_selector(
+        preds,lookback_days=28,min_bets=100
+    )
+    return preds,selected,metrics,rules,current_rule,current_stats
 
 try:
     today=flatten(fetch_today(),False)
@@ -45,11 +57,18 @@ if today.empty:
 
 hist=load_hist()
 models=load_models()
-st.success(f'過去実戦データ {hist["race_id"].nunique() if not hist.empty else 0:,}レースを読み込みました。')
 if models is None:
-    st.warning("学習データ不足のため本番予想を停止しています。")
+    st.error("学習モデルを作成できませんでした。")
     st.stop()
 
+pred_hist,selector_bt,selector_metrics,rule_log,current_rule,current_stats=selector_assets()
+
+st.success(
+    f'過去実戦データ {hist["race_id"].nunique():,}レース。'
+    f' 利益選別AI用の時系列予測 {len(pred_hist):,}レース。'
+)
+
+# Date/time filtering
 dt=pd.to_datetime(today["closed_at"],errors="coerce")
 if dt.dt.tz is None:
     dt=dt.dt.tz_localize(JST,nonexistent="shift_forward",ambiguous="NaT")
@@ -64,38 +83,57 @@ base_detail={}
 for rid,g in valid.groupby("race_id"):
     try:
         tri=trifecta_table(models,g)
-        base_detail[rid]=tri
+        sig=selection_signals(tri)
         top=tri.iloc[0]
+        base_detail[rid]=tri
+        score,rule_pass=current_buy_score({
+            '確率1位%':float(top["prob"]*100),
+            '確率差':float(sig["prob_margin"]),
+            '確信度':float(sig["confidence"]),
+            '確率1位':str(top["combo"]),
+        },current_rule)
         base_rows.append({
             "race_id":rid,"race_date":g["race_date"].iloc[0],
             "場":g["venue"].iloc[0],"R":int(g["race_no"].iloc[0]),
             "締切":pd.Timestamp(g["closed_at_jst"].iloc[0]).strftime("%H:%M"),
             "残り分":float(g["minutes_left"].iloc[0]),
             "確率1位":top["combo"],"確率1位%":float(top["prob"]*100),
-            "確信度":race_confidence(tri)
+            "確率差":float(sig["prob_margin"]),
+            "確信度":float(sig["confidence"]),
+            "利益選別スコア":score,
+            "過去条件通過":rule_pass,
         })
     except Exception:
         pass
 
 base=pd.DataFrame(base_rows)
-st.subheader("AI一次評価（締切まで10分以上）")
+st.subheader("利益選別AI：一次評価")
 if base.empty:
     st.info("現在、条件を満たすレースはありません。")
     st.stop()
-st.dataframe(base.sort_values(["残り分","確信度"],ascending=[True,False]),use_container_width=True,hide_index=True)
 
-# Max 24: near-term purchase candidates, mixed confidence.
+# Prefer rule-passing races but keep near-term fallback for odds coverage.
 pool=base[base["残り分"]<=240].copy()
-if len(pool)>24:
-    safe_ids=pool.sort_values("確信度",ascending=False).head(12)["race_id"].tolist()
-    broad_ids=pool.sort_values("残り分").head(12)["race_id"].tolist()
-    selected=list(dict.fromkeys(safe_ids+broad_ids))[:24]
-    pool=pool[pool["race_id"].isin(selected)].copy()
+preferred=pool[pool["過去条件通過"]].sort_values(
+    ["利益選別スコア","確率1位%"],ascending=False
+)
+fallback=pool[~pool["過去条件通過"]].sort_values("残り分")
+selected_ids=list(dict.fromkeys(
+    preferred["race_id"].tolist()+fallback["race_id"].tolist()
+))[:24]
+pool=pool[pool["race_id"].isin(selected_ids)].copy()
 
-def fetch_one(row, retry=False):
+st.dataframe(
+    base.sort_values(
+        ["過去条件通過","利益選別スコア","残り分"],
+        ascending=[False,False,True]
+    ),
+    use_container_width=True,hide_index=True
+)
+
+def fetch_one(row,retry=False):
     d=pd.Timestamp(row["race_date"]).strftime("%Y%m%d")
     if retry:
-        # uncached longer retry
         odds,url,diag=fetch_trifecta_odds(d,row["場"],int(row["R"]),timeout=12)
     else:
         odds,url,diag=odds_cached(d,row["場"],int(row["R"]))
@@ -112,16 +150,13 @@ with st.status("実オッズを取得しています…",expanded=False) as stat
                 odds_map[rid]=(odds,url,diag)
             except Exception:
                 pass
-
-    # Retry only missing/incomplete odds once, uncached and longer timeout.
     missing=[]
     for _,r in pool.iterrows():
-        rid=r["race_id"]
-        odds=odds_map.get(rid,(pd.DataFrame(),None,[]))[0]
+        odds=odds_map.get(r["race_id"],(pd.DataFrame(),None,[]))[0]
         if odds is None or len(odds)<100:
             missing.append(r)
     if missing:
-        status.update(label=f"未取得 {len(missing)}レースを再試行しています…",state="running")
+        status.update(label=f"オッズ未取得 {len(missing)}レースを再試行中…",state="running")
         with ThreadPoolExecutor(max_workers=4) as ex:
             futures=[ex.submit(fetch_one,r,True) for r in missing]
             for fut in as_completed(futures):
@@ -134,62 +169,117 @@ with st.status("実オッズを取得しています…",expanded=False) as stat
                         odds_map[rid]=(old[0],old[1],(old[2] or [])+(diag or []))
                 except Exception:
                     pass
-    status.update(label="実オッズ取得処理が完了しました",state="complete")
+    status.update(label="実オッズ取得完了",state="complete")
 
 race_rows=[]
 detail={}
 for _,row in pool.iterrows():
     rid=row["race_id"]
     tri=base_detail[rid].copy()
-    odds,url,diag=odds_map.get(rid,(pd.DataFrame(columns=["combo","odds"]),None,[]))
+    odds,url,diag=odds_map.get(
+        rid,(pd.DataFrame(columns=["combo","odds"]),None,[])
+    )
     if odds is None or odds.empty:
         odds=pd.DataFrame(columns=["combo","odds"])
-    odds=odds[[c for c in ["combo","odds"] if c in odds.columns]].copy()
     if "combo" not in odds: odds["combo"]=pd.Series(dtype=object)
     if "odds" not in odds: odds["odds"]=pd.Series(dtype=float)
     tri=tri.merge(odds[["combo","odds"]],on="combo",how="left")
     tri["expected_value"]=tri["prob"]*tri["odds"]
     detail[rid]=tri
 
-    top=tri.iloc[0]
-    ev=tri.dropna(subset=["expected_value"]).sort_values("expected_value",ascending=False)
-    best=ev.iloc[0] if len(ev) else top
+    # Final recommendation: among combinations with non-trivial probability,
+    # maximize EV, but do not force a recommendation when odds are unavailable.
+    ev=tri.dropna(subset=["expected_value"]).copy()
+    ev=ev[ev["prob"]>=0.008]
+    best=ev.sort_values(
+        ["expected_value","prob"],ascending=False
+    ).iloc[0] if len(ev) else tri.iloc[0]
+
+    has_odds=len(odds)>=100
+    ev_val=best.get("expected_value",np.nan)
+    selector_pass=bool(row["過去条件通過"])
+    # Today's final buy rule combines historical selector + actual current EV.
+    buy = bool(
+        selector_pass and has_odds and pd.notna(ev_val) and
+        float(ev_val)>=1.05 and float(best["prob"])>=0.008
+    )
+    # Stronger flag for conservative/firm candidates.
+    firm = bool(
+        selector_pass and has_odds and pd.notna(ev_val) and
+        float(ev_val)>=1.00 and float(best["prob"])>=0.025
+    )
+
     race_rows.append({
         "race_id":rid,"race_date":row["race_date"],"場":row["場"],"R":row["R"],
-        "締切":row["締切"],"残り分":row["残り分"],"確信度":row["確信度"],
-        "確率1位":top["combo"],"確率1位%":float(top["prob"]*100),
+        "締切":row["締切"],"残り分":row["残り分"],
+        "利益選別スコア":row["利益選別スコア"],
+        "過去条件通過":selector_pass,
         "推奨3連単":best["combo"],"予測確率%":float(best["prob"]*100),
-        "実オッズ":best.get("odds",np.nan),"期待値":best.get("expected_value",np.nan),
-        "オッズ取得":bool(len(odds)>=100),"取得組合せ数":int(len(odds)),
-        "取得経路":diag[-1].get("route") if diag else ""
+        "実オッズ":best.get("odds",np.nan),"期待値":ev_val,
+        "確信度":row["確信度"],"確率差":row["確率差"],
+        "オッズ取得":has_odds,"取得組合せ数":int(len(odds)),
+        "購入候補":buy,"堅め候補":firm,
     })
+
 races=pd.DataFrame(race_rows)
-
 st.subheader("最終評価対象")
-st.dataframe(races,use_container_width=True,hide_index=True)
-if not races.empty:
-    ok=races[races["オッズ取得"]]
-    st.success(f"実オッズ100通り以上取得：{len(ok)}/{len(races)}レース")
+st.dataframe(
+    races.sort_values(
+        ["購入候補","利益選別スコア","期待値"],
+        ascending=[False,False,False]
+    ),
+    use_container_width=True,hide_index=True
+)
 
-safe=races.copy()
-safe=safe[safe["予測確率%"]>=2.0]
-safe=safe[(safe["期待値"].isna())|(safe["期待値"]>=0.90)]
-safe=safe.sort_values(["確信度","予測確率%"],ascending=False).head(10)
+buy10=races[races["購入候補"]].sort_values(
+    ["利益選別スコア","期待値","予測確率%"],
+    ascending=False
+).head(10)
+firm10=races[races["堅め候補"]].sort_values(
+    ["予測確率%","利益選別スコア","期待値"],
+    ascending=False
+).head(10)
+hole10=races[
+    races["購入候補"] & (races["予測確率%"]<3.0)
+].sort_values(
+    ["期待値","利益選別スコア"],ascending=False
+).head(10)
 
-holes=races.dropna(subset=["期待値"]).copy()
-holes=holes[(holes["予測確率%"]>=1.0)&(holes["期待値"]>=1.05)]
-holes=holes.sort_values(["期待値","予測確率%"],ascending=False).head(10)
+st.subheader("利益優先・購入候補 TOP10")
+if buy10.empty:
+    st.info("現在、過去条件と実期待値の両方を満たすレースはありません。無理に購入候補を出しません。")
+else:
+    st.dataframe(
+        buy10[["場","R","締切","残り分","推奨3連単","予測確率%","実オッズ","期待値","利益選別スコア"]],
+        use_container_width=True,hide_index=True
+    )
 
-# Prediction ledger
+c1,c2=st.columns(2)
+with c1:
+    st.subheader("堅め候補 TOP10")
+    if firm10.empty:
+        st.info("堅め条件を満たす候補はありません。")
+    else:
+        st.dataframe(
+            firm10[["場","R","締切","推奨3連単","予測確率%","実オッズ","期待値","利益選別スコア"]],
+            use_container_width=True,hide_index=True
+        )
+with c2:
+    st.subheader("穴候補 TOP10")
+    if hole10.empty:
+        st.info("穴条件を満たす候補はありません。")
+    else:
+        st.dataframe(
+            hole10[["場","R","締切","推奨3連単","予測確率%","実オッズ","期待値","利益選別スコア"]],
+            use_container_width=True,hide_index=True
+        )
+
+# Record only actual buy candidates, not all odds-available predictions.
 ledger=load_ledger()
-recordable=races[
-    races["オッズ取得"] & races["期待値"].notna() & races["実オッズ"].notna()
-].copy()
+recordable=buy10.copy()
 ledger=upsert_predictions(
     ledger,recordable,now.strftime("%Y-%m-%d %H:%M:%S"),stake_yen=100
 )
-
-# Reliable result retrieval: retry every pending date, not only today's in-memory data.
 pending_dates=ledger.loc[ledger["status"]=="pending","race_date"].dropna().tolist()
 if pending_dates:
     result_df=fetch_results_for_dates(pending_dates)
@@ -198,43 +288,63 @@ if pending_dates:
     )
 save_ledger(ledger)
 
-c1,c2=st.columns(2)
-with c1:
-    st.subheader("堅め候補 TOP10")
-    st.dataframe(safe[["場","R","締切","残り分","推奨3連単","予測確率%","実オッズ","期待値","確信度"]],use_container_width=True,hide_index=True)
-with c2:
-    st.subheader("穴候補 TOP10（期待値順）")
-    if holes.empty:
-        st.info("条件を満たす穴候補はありません。")
-    else:
-        st.dataframe(holes[["場","R","締切","残り分","推奨3連単","予測確率%","実オッズ","期待値","確信度"]],use_container_width=True,hide_index=True)
+st.subheader("利益選別AIの二重時系列バックテスト")
+base_stats=summarize(pred_hist)
+b1,b2,b3,b4=st.columns(4)
+b1.metric("元AI 全レース数",f'{base_stats["races"]:,}')
+b2.metric("元AI 回収率",f'{base_stats["roi"]*100:.1f}%')
+b3.metric("選別後レース数",f'{selector_metrics.get("races",0):,}')
+b4.metric("選別後回収率",f'{selector_metrics.get("roi",0)*100:.1f}%')
 
-st.subheader("実戦成績・自動精算")
+if selector_metrics:
+    st.write(
+        f'選別後の3連単1点的中率：**{selector_metrics["hit_rate"]*100:.1f}%**　'
+        f'検証収支：**{selector_metrics["profit"]:+,.0f}円**'
+    )
+    st.caption(
+        "重要：購入条件は各テスト期間より前の予測結果だけで最適化し、"
+        "次の未見期間へ適用しています。過去全体を見て後付けした条件ではありません。"
+    )
+    if not rule_log.empty:
+        st.dataframe(rule_log.tail(10),use_container_width=True,hide_index=True)
+else:
+    st.warning("利益選別AIの検証期間が不足しています。")
+
+st.subheader("現在の利益選別条件")
+if current_rule:
+    st.write({
+        "最低AI確率":round(float(current_rule.get("min_prob") or 0)*100,3),
+        "最低確率差":round(float(current_rule.get("min_margin") or 0)*100,3),
+        "最低確信度":round(float(current_rule.get("min_conf") or 0),4),
+        "1着艇限定":current_rule.get("first_lane") or "なし",
+        "過去選別学習レース数":current_stats.get("races"),
+        "過去選別期間回収率":round(float(current_stats.get("roi",0))*100,1),
+        "縮小補正回収率":round(float(current_stats.get("shrunk_roi",0))*100,1),
+    })
+    st.caption(
+        "当日はこの過去条件を通過したレースに、実オッズ期待値>=1.05を追加して購入候補にします。"
+    )
+
+st.subheader("実戦成績・自動精算（購入候補のみ）")
 settled=ledger[ledger["status"]=="settled"].copy()
 pending=ledger[ledger["status"]=="pending"].copy()
 m1,m2,m3,m4=st.columns(4)
-m1.metric("記録予想数",f"{len(ledger):,}")
+m1.metric("記録購入候補",f"{len(ledger):,}")
 m2.metric("結果確定",f"{len(settled):,}")
 if len(settled):
     hit=pd.to_numeric(settled["hit"],errors="coerce").fillna(False).astype(bool)
     stake=pd.to_numeric(settled["stake_yen"],errors="coerce").fillna(0).sum()
     ret=pd.to_numeric(settled["return_yen"],errors="coerce").fillna(0).sum()
-    m3.metric("的中率",f"{hit.mean()*100:.1f}%")
-    m4.metric("回収率",f"{(ret/stake*100 if stake else 0):.1f}%")
-    profit=pd.to_numeric(settled["profit_yen"],errors="coerce").fillna(0).sum()
-    st.write(f"100円/予想換算の累計収支：**{profit:+,.0f}円**")
-    miss=settled[~hit]
-    if len(miss):
-        st.subheader("外れ原因")
-        st.dataframe(miss["miss_type"].fillna("不明").value_counts().rename_axis("外れ方").reset_index(name="件数"),use_container_width=True,hide_index=True)
+    m3.metric("実戦的中率",f"{hit.mean()*100:.1f}%")
+    m4.metric("実戦回収率",f"{(ret/stake*100 if stake else 0):.1f}%")
 else:
-    m3.metric("的中率","—"); m4.metric("回収率","—")
-st.caption(f"結果待ち：{len(pending)}件。未確定レースは次回表示時にも自動再取得します。")
+    m3.metric("実戦的中率","—");m4.metric("実戦回収率","—")
+st.caption(f"結果待ち：{len(pending)}件")
 
 st.download_button(
     "成績CSVを保存",
     data=ledger.to_csv(index=False).encode("utf-8-sig"),
-    file_name="boatrace_ai_prediction_log_v26.csv",
+    file_name="boatrace_ai_profit_selector_v27.csv",
     mime="text/csv"
 )
 
@@ -243,25 +353,20 @@ if detail:
     rid=st.selectbox("レースを選択",list(detail.keys()))
     t=detail[rid].copy()
     t["prob_pct"]=t["prob"]*100
-    st.dataframe(t[["combo","prob_pct","odds","expected_value"]].sort_values("expected_value",ascending=False,na_position="last"),use_container_width=True,hide_index=True)
-
-st.subheader("時系列バックテスト（未来データを学習に使わない）")
-bt,metrics=cached_backtest()
-if metrics:
-    b1,b2,b3,b4=st.columns(4)
-    b1.metric("検証レース",f'{metrics["races"]:,}')
-    b2.metric("3連単1点的中率",f'{metrics["hit_rate"]*100:.1f}%')
-    b3.metric("100円1点回収率",f'{metrics["roi"]*100:.1f}%')
-    b4.metric("検証収支",f'{metrics["profit"]:+,.0f}円')
-    st.caption("各検証期間より前のデータだけで学習しています。払戻は公式3連単払戻額を100円購入として計算します。")
-    st.dataframe(bt.tail(50),use_container_width=True,hide_index=True)
-else:
-    st.info("バックテストに必要な期間のデータが不足しています。")
+    st.dataframe(
+        t[["combo","prob_pct","odds","expected_value"]]
+        .sort_values(["expected_value","prob_pct"],ascending=False,na_position="last"),
+        use_container_width=True,hide_index=True
+    )
 
 st.subheader("AI再学習")
 if st.button("最新結果で再学習する"):
     st.cache_data.clear()
     st.cache_resource.clear()
-    st.success("キャッシュをクリアしました。ページを再読み込みすると最新結果で再学習します。")
+    st.success("キャッシュをクリアしました。ページ再読込で最新結果を反映します。")
 
-st.caption("予測は統計モデルによる推定で、的中・利益を保証しません。実オッズ未取得時は期待値を推測しません。")
+st.caption(
+    "利益を保証するシステムではありません。バックテストで100%を超えても将来の回収率は保証されません。"
+    "過去のリアルタイムオッズを保存していないため、利益選別AIの過去検証には当時のオッズ/期待値を使っていません。"
+    "当日だけ実オッズ期待値を最終フィルターとして使用します。"
+)
