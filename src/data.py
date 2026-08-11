@@ -1,12 +1,17 @@
 from __future__ import annotations
 from datetime import date, timedelta
+import time
 import requests
 import pandas as pd
 
 BASE='https://boatraceopenapi.github.io/api/v1'
 NAMES={1:'桐生',2:'戸田',3:'江戸川',4:'平和島',5:'多摩川',6:'浜名湖',7:'蒲郡',8:'常滑',9:'津',10:'三国',11:'びわこ',12:'住之江',13:'尼崎',14:'鳴門',15:'丸亀',16:'児島',17:'宮島',18:'徳山',19:'下関',20:'若松',21:'芦屋',22:'福岡',23:'唐津',24:'大村'}
 JCD={v:f'{k:02d}' for k,v in NAMES.items()}
-HEADERS={'User-Agent':'BoatRaceAI-FreeDashboard/2.1'}
+HEADERS={
+    'User-Agent':'BoatRaceAI-FreeDashboard/2.6',
+    'Cache-Control':'no-cache',
+    'Pragma':'no-cache',
+}
 
 def get_json(url,timeout=30):
     r=requests.get(url,timeout=timeout,headers=HEADERS)
@@ -16,15 +21,22 @@ def get_json(url,timeout=30):
     return r.json()
 
 def fetch_today():
-    return get_json(f'{BASE}/today.json')
+    # cache-buster helps when an upstream CDN is serving a stale today's JSON
+    return get_json(f'{BASE}/today.json?_={int(time.time())}')
 
 def fetch_day(d):
     d=pd.Timestamp(d).date()
-    return get_json(f'{BASE}/{d:%Y}/{d:%Y%m%d}.json')
+    return get_json(f'{BASE}/{d:%Y}/{d:%Y%m%d}.json?_={int(time.time())}')
 
 def _pct(x):
     try:
         return float(x)/100.0 if x is not None else None
+    except Exception:
+        return None
+
+def _finish_num(x):
+    try:
+        return int(x)
     except Exception:
         return None
 
@@ -40,9 +52,11 @@ def flatten(payload, include_result=True):
             tri=((result.get('payouts') or {}).get('trifecta') or [])
             tri_combo=tri[0].get('combination') if tri else None
             tri_pay=tri[0].get('amount') if tri else None
+
             for ek,racer in (race.get('racers') or {}).items():
                 p=pr.get(ek) or {}
                 z=rr.get(ek) or {}
+                finish=_finish_num(z.get('place_number')) if include_result else None
                 rows.append({
                     'race_id':f"{race.get('date','')}-{int(sk):02d}-{int(rk):02d}",
                     'race_date':race.get('date'),
@@ -72,17 +86,20 @@ def flatten(payload, include_result=True):
                     'preview_start_timing':p.get('start_timing'),
                     'exhibition_time':p.get('exhibition_time'),
                     'wind_speed':preview.get('wind_speed'),
+                    'wind_direction':preview.get('wind_direction_number', preview.get('wind_direction')),
                     'wave_height_cm':preview.get('wave_height'),
                     'air_temperature':preview.get('air_temperature'),
                     'water_temperature':preview.get('water_temperature'),
-                    'finish_num':z.get('place_number') if include_result else None,
-                    'win':1 if include_result and z.get('place_number')==1 else 0,
+                    'finish_num':finish,
+                    'is_first':1 if finish==1 else 0,
+                    'is_second':1 if finish==2 else 0,
+                    'is_third':1 if finish==3 else 0,
                     'trifecta_result':tri_combo if include_result else None,
                     'trifecta_payout':tri_pay if include_result else None,
                 })
     return pd.DataFrame(rows)
 
-def historical_dataset(days=60):
+def historical_dataset(days=90):
     today=pd.Timestamp.now(tz='Asia/Tokyo').date()
     frames=[]
     for i in range(days,0,-1):
@@ -94,6 +111,20 @@ def historical_dataset(days=60):
             if obj:
                 x=flatten(obj,True)
                 if not x.empty and 'finish_num' in x and x['finish_num'].notna().any():
+                    frames.append(x)
+        except Exception:
+            pass
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+
+def fetch_results_for_dates(dates):
+    """Pending prediction dates are re-fetched every app run until settled."""
+    frames=[]
+    for d in sorted({str(x)[:10] for x in dates if pd.notna(x)}):
+        try:
+            obj=fetch_day(d)
+            if obj:
+                x=flatten(obj,True)
+                if not x.empty:
                     frames.append(x)
         except Exception:
             pass

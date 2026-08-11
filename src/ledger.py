@@ -2,11 +2,11 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 
-COLUMNS = [
+COLUMNS=[
     "recorded_at","race_id","race_date","venue","race_no","closed_at",
     "combo","pred_prob","odds","expected_value","confidence",
     "actual_combo","actual_payout","hit","stake_yen","return_yen","profit_yen",
-    "status","miss_type"
+    "status","miss_type","settled_at"
 ]
 
 def empty_ledger():
@@ -33,35 +33,25 @@ def save_ledger(df,path="data/prediction_log.csv"):
 def upsert_predictions(ledger,preds,recorded_at,stake_yen=100):
     if preds is None or preds.empty:
         return ledger
-    rows=[]
     existing=set(zip(
         ledger.get("race_id",pd.Series(dtype=str)).astype(str),
         ledger.get("combo",pd.Series(dtype=str)).astype(str)
     ))
+    rows=[]
     for _,r in preds.iterrows():
         key=(str(r["race_id"]),str(r["推奨3連単"]))
         if key in existing:
             continue
         rows.append({
-            "recorded_at":recorded_at,
-            "race_id":r["race_id"],
-            "race_date":str(r.get("race_date","")),
-            "venue":r["場"],
-            "race_no":int(r["R"]),
-            "closed_at":r["締切"],
-            "combo":r["推奨3連単"],
-            "pred_prob":float(r["予測確率%"])/100.0,
-            "odds":r.get("実オッズ"),
-            "expected_value":r.get("期待値"),
-            "confidence":r.get("確信度"),
-            "actual_combo":pd.NA,
-            "actual_payout":pd.NA,
-            "hit":pd.NA,
-            "stake_yen":stake_yen,
-            "return_yen":pd.NA,
-            "profit_yen":pd.NA,
-            "status":"pending",
-            "miss_type":pd.NA,
+            "recorded_at":recorded_at,"race_id":r["race_id"],
+            "race_date":str(r.get("race_date","")),"venue":r["場"],
+            "race_no":int(r["R"]),"closed_at":r["締切"],
+            "combo":r["推奨3連単"],"pred_prob":float(r["予測確率%"])/100.0,
+            "odds":r.get("実オッズ"),"expected_value":r.get("期待値"),
+            "confidence":r.get("確信度"),"actual_combo":pd.NA,
+            "actual_payout":pd.NA,"hit":pd.NA,"stake_yen":stake_yen,
+            "return_yen":pd.NA,"profit_yen":pd.NA,"status":"pending",
+            "miss_type":pd.NA,"settled_at":pd.NA
         })
     if rows:
         ledger=pd.concat([ledger,pd.DataFrame(rows)],ignore_index=True)
@@ -71,22 +61,17 @@ def classify_miss(pred,actual):
     if not pred or not actual:
         return "結果未確定"
     try:
-        p=pred.split("-"); a=actual.split("-")
-        if p[0] != a[0]:
-            return "1着予測外れ"
-        if p[1:] == a[1:]:
-            return "的中"
-        if set(p[1:]) == set(a[1:]):
-            return "2・3着順違い"
-        if p[1] == a[1]:
-            return "3着外れ"
-        if p[2] == a[2]:
-            return "2着外れ"
+        p=str(pred).split("-"); a=str(actual).split("-")
+        if p==a:return "的中"
+        if p[0]!=a[0]:return "1着予測外れ"
+        if set(p[1:])==set(a[1:]):return "2・3着順違い"
+        if p[1]==a[1]:return "3着外れ"
+        if p[2]==a[2]:return "2着外れ"
         return "相手艇外れ"
     except Exception:
         return "組合せ外れ"
 
-def apply_results(ledger,result_df):
+def apply_results(ledger,result_df,settled_at=None):
     if ledger.empty or result_df is None or result_df.empty:
         return ledger
     result_map={}
@@ -94,10 +79,8 @@ def apply_results(ledger,result_df):
         actual=g["trifecta_result"].dropna()
         payout=pd.to_numeric(g["trifecta_payout"],errors="coerce").dropna()
         if len(actual):
-            result_map[str(rid)]=(
-                str(actual.iloc[0]),
-                float(payout.iloc[0]) if len(payout) else None
-            )
+            result_map[str(rid)]=(str(actual.iloc[0]),float(payout.iloc[0]) if len(payout) else None)
+
     for i,row in ledger.iterrows():
         if str(row["status"])=="settled":
             continue
@@ -106,7 +89,7 @@ def apply_results(ledger,result_df):
             continue
         actual,payout=result_map[rid]
         pred=str(row["combo"])
-        hit=(pred==actual)
+        hit=pred==actual
         stake=float(row["stake_yen"]) if pd.notna(row["stake_yen"]) else 100.0
         ret=float(payout) if hit and payout is not None else 0.0
         ledger.at[i,"actual_combo"]=actual
@@ -116,4 +99,5 @@ def apply_results(ledger,result_df):
         ledger.at[i,"profit_yen"]=ret-stake
         ledger.at[i,"status"]="settled"
         ledger.at[i,"miss_type"]=classify_miss(pred,actual)
+        ledger.at[i,"settled_at"]=settled_at
     return ledger
