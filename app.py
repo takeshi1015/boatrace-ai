@@ -13,7 +13,7 @@ JST = ZoneInfo("Asia/Tokyo")
 
 st.set_page_config(page_title="BOAT RACE AI", layout="wide")
 st.title("BOAT RACE AI 予想ダッシュボード")
-st.caption("無料版 v2.3：公式3連単オッズ表対応・高速化・実データ学習")
+st.caption("無料版 v2.4：実オッズ取得最優先・複数経路診断対応")
 
 now = pd.Timestamp.now(tz=JST)
 st.write(f"現在時刻：{now:%Y/%m/%d %H:%M:%S}")
@@ -28,7 +28,7 @@ def load_model():
 
 @st.cache_data(ttl=120, show_spinner=False)
 def odds_cached(d, v, r):
-    return fetch_trifecta_odds(d, v, r, timeout=6)
+    return fetch_trifecta_odds(d, v, r, timeout=7)
 
 try:
     today = flatten(fetch_today(), False)
@@ -114,8 +114,8 @@ st.info(f"実オッズは購入時間を優先し、最大 {len(pool)} レース
 
 def fetch_one(row):
     d = pd.Timestamp(row["race_date"]).strftime("%Y%m%d")
-    odds, url = odds_cached(d, row["場"], int(row["R"]))
-    return row["race_id"], odds, url
+    odds, url, diag = odds_cached(d, row["場"], int(row["R"]))
+    return row["race_id"], odds, url, diag
 
 odds_map = {}
 progress = st.progress(0, text="実オッズを取得しています…")
@@ -127,8 +127,8 @@ with ThreadPoolExecutor(max_workers=8) as ex:
     futures = [ex.submit(fetch_one, r) for r in rows_for_fetch]
     for fut in as_completed(futures):
         try:
-            rid, odds, url = fut.result()
-            odds_map[rid] = (odds, url)
+            rid, odds, url, diag = fut.result()
+            odds_map[rid] = (odds, url, diag)
         except Exception:
             pass
         done += 1
@@ -142,7 +142,7 @@ detail = {}
 for _, row in pool.iterrows():
     rid = row["race_id"]
     tri = base_detail[rid].copy()
-    odds, url = odds_map.get(rid, (pd.DataFrame(columns=["combo","odds"]), None))
+    odds, url, diag = odds_map.get(rid, (pd.DataFrame(columns=["combo","odds"]), None, []))
 
     if odds is None or odds.empty:
         odds = pd.DataFrame(columns=["combo","odds"])
@@ -177,6 +177,7 @@ for _, row in pool.iterrows():
         "期待値": best.get("expected_value", np.nan),
         "オッズ取得": bool(len(odds) > 0),
         "取得組合せ数": int(len(odds)),
+        "取得経路": (diag[-1].get("route") if diag else ""),
     })
 
 races = pd.DataFrame(race_rows)
@@ -235,6 +236,28 @@ if detail:
         use_container_width=True,
         hide_index=True
     )
+
+st.subheader("実オッズ取得診断")
+if odds_map:
+    diag_rows = []
+    for rid, payload in odds_map.items():
+        odds0, url0, diags0 = payload
+        for d0 in diags0:
+            diag_rows.append({
+                "race_id": rid,
+                "route": d0.get("route"),
+                "http_status": d0.get("http_status"),
+                "bytes": d0.get("bytes"),
+                "has_3t_title": d0.get("has_3t_title"),
+                "no_data": d0.get("no_data"),
+                "tables": d0.get("tables"),
+                "parsed_count": d0.get("parsed_count"),
+                "error": d0.get("error"),
+            })
+    diag_df = pd.DataFrame(diag_rows)
+    if not diag_df.empty:
+        st.dataframe(diag_df, use_container_width=True, hide_index=True)
+        st.caption("official-direct が第一経路。directで取得できない場合のみ official-via-reader を使用します。")
 
 st.subheader("AIの学習・外れ分析")
 if hist.empty or model is None:
