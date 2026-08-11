@@ -20,7 +20,7 @@ from src.backtest import (
 JST = ZoneInfo("Asia/Tokyo")
 st.set_page_config(page_title="BOAT RACE AI", layout="wide")
 st.title("BOAT RACE AI 予想ダッシュボード")
-st.caption("無料版 v2.8：未見データ100%超ゲート・利益選別AI")
+st.caption("無料版 v2.8.1：結果台帳型修正・未見データ100%超ゲート")
 
 now = pd.Timestamp.now(tz=JST)
 st.write(f"現在時刻：{now:%Y/%m/%d %H:%M:%S}")
@@ -334,12 +334,19 @@ ledger = upsert_predictions(
 
 pending_dates = ledger.loc[ledger["status"]=="pending","race_date"].dropna().tolist()
 if pending_dates:
-    result_df = fetch_results_for_dates(pending_dates)
-    ledger = apply_results(
-        ledger,
-        result_df,
-        settled_at=now.strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    try:
+        result_df = fetch_results_for_dates(pending_dates)
+        ledger = apply_results(
+            ledger,
+            result_df,
+            settled_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    except Exception as e:
+        # 結果処理で異常があっても予想画面全体は停止させない
+        st.warning(
+            "結果自動精算の一部でエラーが発生しました。"
+            "予想・オッズ・実戦投入ゲートの表示は継続します。"
+        )
 save_ledger(ledger)
 
 st.subheader("元AI vs 未見選別AI")
