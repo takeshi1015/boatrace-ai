@@ -8,12 +8,13 @@ import streamlit as st
 from src.data import fetch_today, flatten, historical_dataset
 from src.model import fit_model, race_probs, trifecta_table
 from src.odds import fetch_trifecta_odds
+from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
 JST = ZoneInfo("Asia/Tokyo")
 
 st.set_page_config(page_title="BOAT RACE AI", layout="wide")
 st.title("BOAT RACE AI 予想ダッシュボード")
-st.caption("無料版 v2.4：実オッズ取得最優先・複数経路診断対応")
+st.caption("無料版 v2.5：結果自動取得・的中判定・収支・外れ分析・再学習")
 
 now = pd.Timestamp.now(tz=JST)
 st.write(f"現在時刻：{now:%Y/%m/%d %H:%M:%S}")
@@ -164,6 +165,7 @@ for _, row in pool.iterrows():
 
     race_rows.append({
         "race_id": rid,
+        "race_date": row["race_date"],
         "場": row["場"],
         "R": row["R"],
         "締切": row["締切"],
@@ -205,6 +207,32 @@ holes = races.dropna(subset=["期待値"]).copy()
 holes = holes[holes["予測確率%"] >= 1.5]
 holes = holes.sort_values("期待値", ascending=False).head(10)
 
+# ---- v2.5 予想ログ・結果自動追跡 ----
+ledger = load_ledger()
+
+# 実オッズが取得でき、期待値が計算できた最終候補だけ自動記録
+recordable = races[
+    races["オッズ取得"]
+    & races["期待値"].notna()
+    & races["実オッズ"].notna()
+].copy()
+
+ledger = upsert_predictions(
+    ledger,
+    recordable,
+    recorded_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+    stake_yen=100
+)
+
+# 今日の結果を取り直し、確定済みレースを自動精算
+try:
+    today_results = flatten(fetch_today(), True)
+    ledger = apply_results(ledger, today_results)
+except Exception:
+    pass
+
+save_ledger(ledger)
+
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("堅め候補 TOP10")
@@ -224,6 +252,84 @@ with c2:
             use_container_width=True,
             hide_index=True
         )
+
+st.subheader("実戦成績・自動精算")
+if ledger.empty:
+    st.info("まだ記録された予想はありません。実オッズ取得済みの予想から自動記録します。")
+else:
+    settled = ledger[ledger["status"]=="settled"].copy()
+    pending = ledger[ledger["status"]=="pending"].copy()
+
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric("記録予想数", f"{len(ledger):,}")
+    m2.metric("結果確定", f"{len(settled):,}")
+    if len(settled):
+        hit_rate = pd.to_numeric(settled["hit"],errors="coerce").fillna(False).astype(bool).mean()*100
+        stake = pd.to_numeric(settled["stake_yen"],errors="coerce").fillna(0).sum()
+        ret = pd.to_numeric(settled["return_yen"],errors="coerce").fillna(0).sum()
+        roi = (ret/stake*100) if stake>0 else 0
+        profit = pd.to_numeric(settled["profit_yen"],errors="coerce").fillna(0).sum()
+        m3.metric("的中率", f"{hit_rate:.1f}%")
+        m4.metric("回収率", f"{roi:.1f}%")
+        st.write(f"100円/予想での累計収支：**{profit:+,.0f}円**")
+
+        st.subheader("外れ分析")
+        miss = settled[settled["hit"]!=True].copy()
+        if miss.empty:
+            st.success("確定済み予想はすべて的中しています。")
+        else:
+            miss_summary = (
+                miss["miss_type"]
+                .fillna("不明")
+                .value_counts()
+                .rename_axis("外れ方")
+                .reset_index(name="件数")
+            )
+            st.dataframe(miss_summary,use_container_width=True,hide_index=True)
+
+            # 外れ方別に確率・EVの傾向を見る
+            diag = (
+                miss.groupby("miss_type",dropna=False)
+                .agg(
+                    件数=("race_id","count"),
+                    平均予測確率=("pred_prob","mean"),
+                    平均期待値=("expected_value","mean"),
+                    平均オッズ=("odds","mean"),
+                )
+                .reset_index()
+            )
+            diag["平均予測確率%"]=diag["平均予測確率"]*100
+            st.dataframe(
+                diag[["miss_type","件数","平均予測確率%","平均期待値","平均オッズ"]],
+                use_container_width=True,hide_index=True
+            )
+
+        st.subheader("直近の確定結果")
+        st.dataframe(
+            settled.tail(30)[[
+                "race_date","venue","race_no","combo","pred_prob","odds","expected_value",
+                "actual_combo","actual_payout","hit","profit_yen","miss_type"
+            ]],
+            use_container_width=True,hide_index=True
+        )
+    else:
+        m3.metric("的中率","—")
+        m4.metric("回収率","—")
+
+    if len(pending):
+        st.caption(f"結果待ち：{len(pending)}件")
+
+    st.download_button(
+        "成績CSVを保存",
+        data=ledger.to_csv(index=False).encode("utf-8-sig"),
+        file_name="boatrace_ai_prediction_log.csv",
+        mime="text/csv"
+    )
+
+    st.caption(
+        "無料Streamlit環境のローカル保存は永続保証されないため、"
+        "成績CSVは定期的に保存してください。"
+    )
 
 st.subheader("3連単120通りのAI確率・期待値")
 if detail:
@@ -259,7 +365,11 @@ if odds_map:
         st.dataframe(diag_df, use_container_width=True, hide_index=True)
         st.caption("official-direct が第一経路。directで取得できない場合のみ official-via-reader を使用します。")
 
-st.subheader("AIの学習・外れ分析")
+st.subheader("AIの再学習状況")
+if st.button("最新結果で再学習する"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.success("学習キャッシュをクリアしました。ページを再読み込みすると最新結果で再学習します。")
 if hist.empty or model is None:
     st.info("過去結果が十分に取得できると、ここに検証結果を表示します。")
 else:
@@ -291,7 +401,7 @@ else:
         miss = chk[~chk["的中"]]
         st.write(
             f"外れ分析対象：{len(miss)}レース。"
-            "結果は次回再学習時の教師データとして自動的に取り込まれます。"
+            "公開結果は過去60日データへ自動追加され、キャッシュ更新時に再学習されます。"
         )
         st.dataframe(miss.tail(20), use_container_width=True, hide_index=True)
 
