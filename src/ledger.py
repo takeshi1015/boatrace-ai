@@ -6,12 +6,12 @@ COLUMNS=[
     "recorded_at","race_id","race_date","venue","race_no","closed_at",
     "combo","pred_prob","odds","expected_value","confidence",
     "actual_combo","actual_payout","hit","stake_yen","return_yen","profit_yen",
-    "status","miss_type","settled_at"
+    "status","miss_type","settled_at","strategy_version"
 ]
 
 STRING_COLUMNS=[
     "recorded_at","race_id","race_date","venue","closed_at",
-    "combo","actual_combo","status","miss_type","settled_at"
+    "combo","actual_combo","status","miss_type","settled_at","strategy_version"
 ]
 NUMERIC_COLUMNS=[
     "race_no","pred_prob","odds","expected_value","confidence",
@@ -67,7 +67,7 @@ def save_ledger(df,path="data/prediction_log.csv"):
     df=normalize_ledger_types(df)
     df.to_csv(p,index=False,encoding="utf-8-sig")
 
-def upsert_predictions(ledger,preds,recorded_at,stake_yen=100):
+def upsert_predictions(ledger,preds,recorded_at,stake_yen=100,strategy_version='legacy'):
     ledger=normalize_ledger_types(ledger)
 
     if preds is None or preds.empty:
@@ -104,7 +104,8 @@ def upsert_predictions(ledger,preds,recorded_at,stake_yen=100):
             "profit_yen":pd.NA,
             "status":"pending",
             "miss_type":pd.NA,
-            "settled_at":pd.NA
+            "settled_at":pd.NA,
+            "strategy_version":str(strategy_version)
         })
 
     if rows:

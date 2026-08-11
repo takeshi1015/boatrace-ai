@@ -18,15 +18,18 @@ from src.backtest import (
 )
 
 JST = ZoneInfo("Asia/Tokyo")
-st.set_page_config(page_title="BOAT RACE AI v2.9.1", layout="wide")
+APP_VERSION = "v2.10"
+V291_CUTOFF = pd.Timestamp("2026-08-11 11:09:00")  # v2.9.1画面確認時刻を基準
+MIN_COMBO_PROB = 0.008
+MIN_EV = 1.05
+DIRECT_REFRESH_MINUTES = 30
+
+st.set_page_config(page_title="BOAT RACE AI v2.10", layout="wide")
 st.title("BOAT RACE AI 購入判断ダッシュボード")
-st.caption("無料版 v2.9.1：120通り実オッズ期待値最適化・購入判断画面")
+st.caption("v2.10：200件自動ゲート・2案提示・30分以内直前オッズ再判定・世代別成績")
 
 now = pd.Timestamp.now(tz=JST)
 
-# -------------------------
-# 操作部
-# -------------------------
 h1, h2 = st.columns([4, 1])
 with h1:
     st.write(f"現在時刻：**{now:%Y/%m/%d %H:%M:%S}**")
@@ -68,9 +71,6 @@ def validation_assets():
     )
     return preds, selected, metrics, folds, gate, current_rule, current_stats
 
-# -------------------------
-# 今日データ
-# -------------------------
 try:
     today = flatten(fetch_today(), False)
 except Exception:
@@ -90,6 +90,11 @@ if models is None:
 pred_hist, selector_bt, selector_metrics, folds, gate, current_rule, current_stats = validation_assets()
 base_stats = summarize(pred_hist)
 
+# ① 200件到達後は毎回自動でゲート判定
+# deployment_gate自体が oos_bets>=200 を条件に含むため、到達後は次回表示時に自動判定される。
+# 200件未満は残件数を明示する。
+remaining_to_gate = max(0, 200 - int(gate["oos_bets"]))
+
 dt = pd.to_datetime(today["closed_at"], errors="coerce")
 if dt.dt.tz is None:
     dt = dt.dt.tz_localize(JST, nonexistent="shift_forward", ambiguous="NaT")
@@ -100,9 +105,9 @@ today["closed_at_jst"] = dt
 today["minutes_left"] = (dt - now).dt.total_seconds() / 60
 valid = today[(today["minutes_left"] >= 10) & (today["minutes_left"] <= 360)].copy()
 
-# -------------------------
-# AI 120通り予測
-# -------------------------
+# ---------------------------
+# AI probability tables
+# ---------------------------
 base_rows = []
 prob_map = {}
 
@@ -120,7 +125,6 @@ for rid, g in valid.groupby("race_id"):
             "R": int(g["race_no"].iloc[0]),
         }, current_rule)
 
-        # race_idをキーにAI120通りを完全保持
         prob_map[str(rid)] = tri[["combo", "prob"]].copy()
 
         base_rows.append({
@@ -145,7 +149,6 @@ if base.empty:
     st.info("現在、締切まで10分以上ある評価可能レースはありません。")
     st.stop()
 
-# 直近4時間から24レース
 pool = base[base["残り分"] <= 240].copy()
 preferred = pool[pool["過去条件通過"]].sort_values(
     ["利益選別スコア", "AI1位確率%"], ascending=False
@@ -156,80 +159,82 @@ ids = list(dict.fromkeys(
 ))[:24]
 pool = pool[pool["race_id"].isin(ids)].copy()
 
-# -------------------------
-# 実オッズ
-# -------------------------
-def fetch_one(row, retry=False):
+# ---------------------------
+# ④ odds fetch with direct refresh inside 30 minutes
+# ---------------------------
+def fetch_one(row):
     d = pd.Timestamp(row["race_date"]).strftime("%Y%m%d")
-    if retry:
+    left = float(row["残り分"])
+
+    # 締切30分以内はキャッシュを使わず直取り
+    if left <= DIRECT_REFRESH_MINUTES:
         odds, url, diag = fetch_trifecta_odds(
             d, row["場"], int(row["R"]), timeout=12
         )
+        refresh_mode = "直前再取得"
     else:
         odds, url, diag = odds_cached(
             d, row["場"], int(row["R"])
         )
-    return str(row["race_id"]), odds, url, diag
+        refresh_mode = "通常取得"
+
+    return str(row["race_id"]), odds, url, diag, refresh_mode
+
+def retry_one(row):
+    d = pd.Timestamp(row["race_date"]).strftime("%Y%m%d")
+    odds, url, diag = fetch_trifecta_odds(
+        d, row["場"], int(row["R"]), timeout=15
+    )
+    return str(row["race_id"]), odds, url, diag, "再試行"
 
 odds_map = {}
 
 with st.status("実オッズを取得しています…", expanded=False) as status:
     rows = [r for _, r in pool.iterrows()]
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futures = [ex.submit(fetch_one, r, False) for r in rows]
+        futures = [ex.submit(fetch_one, r) for r in rows]
         for fut in as_completed(futures):
             try:
-                rid, odds, url, diag = fut.result()
-                odds_map[rid] = (odds, url, diag)
+                rid, odds, url, diag, mode = fut.result()
+                odds_map[rid] = (odds, url, diag, mode)
             except Exception:
                 pass
 
     missing = []
     for _, r in pool.iterrows():
         rid = str(r["race_id"])
-        odds = odds_map.get(rid, (pd.DataFrame(), None, []))[0]
+        odds = odds_map.get(rid, (pd.DataFrame(), None, [], ""))[0]
         if odds is None or len(odds) < 100:
             missing.append(r)
 
     if missing:
-        status.update(
-            label=f"未取得 {len(missing)}レースを再試行しています…",
-            state="running"
-        )
+        status.update(label=f"未取得 {len(missing)}レースを再試行しています…", state="running")
         with ThreadPoolExecutor(max_workers=4) as ex:
-            futures = [ex.submit(fetch_one, r, True) for r in missing]
+            futures = [ex.submit(retry_one, r) for r in missing]
             for fut in as_completed(futures):
                 try:
-                    rid, odds, url, diag = fut.result()
-                    old = odds_map.get(rid, (pd.DataFrame(), None, []))
+                    rid, odds, url, diag, mode = fut.result()
+                    old = odds_map.get(rid, (pd.DataFrame(), None, [], ""))
                     if odds is not None and len(odds) > len(old[0]):
-                        odds_map[rid] = (
-                            odds, url, (old[2] or []) + (diag or [])
-                        )
+                        odds_map[rid] = (odds, url, (old[2] or []) + (diag or []), mode)
                     else:
-                        odds_map[rid] = (
-                            old[0], old[1], (old[2] or []) + (diag or [])
-                        )
+                        odds_map[rid] = (old[0], old[1], (old[2] or []) + (diag or []), old[3])
                 except Exception:
                     pass
 
     status.update(label="実オッズ取得完了", state="complete")
 
-# -------------------------
-# 120通り AI確率 × 実オッズ
-# -------------------------
+# ---------------------------
+# ③ two picks: high-probability and high-EV
+# ---------------------------
 detail_map = {}
 race_rows = []
 
-MIN_COMBO_PROB = 0.008   # 0.8%
-MIN_EV = 1.05
-
 for _, row in pool.iterrows():
     rid = str(row["race_id"])
-
     probs = prob_map.get(rid, pd.DataFrame(columns=["combo", "prob"])).copy()
-    odds, url, diag = odds_map.get(
-        rid, (pd.DataFrame(columns=["combo", "odds"]), None, [])
+    odds, url, diag, refresh_mode = odds_map.get(
+        rid, (pd.DataFrame(columns=["combo", "odds"]), None, [], "")
     )
 
     if odds is None:
@@ -241,86 +246,84 @@ for _, row in pool.iterrows():
     if "odds" not in odds.columns:
         odds["odds"] = pd.Series(dtype=float)
 
-    # comboを明示的に文字列化して結合不一致を防ぐ
     probs["combo"] = probs["combo"].astype(str).str.strip()
     odds["combo"] = odds["combo"].astype(str).str.strip()
     odds["odds"] = pd.to_numeric(odds["odds"], errors="coerce")
 
-    # 重複排除
     odds_clean = (
         odds[["combo", "odds"]]
         .dropna(subset=["combo"])
         .drop_duplicates("combo", keep="last")
     )
 
-    # ここを唯一の120通り詳細データ源とする
     tri = probs.merge(
-        odds_clean,
-        on="combo",
-        how="left",
-        validate="one_to_one",
+        odds_clean, on="combo", how="left", validate="one_to_one"
     )
     tri["expected_value"] = tri["prob"] * tri["odds"]
     tri["prob_pct"] = tri["prob"] * 100
 
-    # 全120通りのうちオッズが何件一致したかを保持
     matched_odds = int(tri["odds"].notna().sum())
     detail_map[rid] = tri.copy()
 
-    # 購入買い目選定：
-    # 予測確率0.8%以上の中から EV 最大を選ぶ。
-    # EV同値なら予測確率が高い方。
-    eligible = tri[
+    # 高確率寄り:
+    # EVが極端に悪くない(>=0.90)中で予測確率最大
+    safe_pool = tri[
+        tri["odds"].notna()
+        & (tri["prob"] >= MIN_COMBO_PROB)
+        & (tri["expected_value"] >= 0.90)
+    ].copy()
+    if safe_pool.empty:
+        safe_pool = tri[
+            tri["odds"].notna()
+            & (tri["prob"] >= MIN_COMBO_PROB)
+        ].copy()
+    if len(safe_pool):
+        safe = safe_pool.sort_values(
+            ["prob", "expected_value"], ascending=False
+        ).iloc[0]
+    else:
+        safe = tri.sort_values("prob", ascending=False).iloc[0]
+
+    # 高期待値寄り:
+    # AI確率0.8%以上の中で期待値最大
+    ev_pool = tri[
         tri["odds"].notna()
         & (tri["prob"] >= MIN_COMBO_PROB)
     ].copy()
-
-    if len(eligible):
-        best = eligible.sort_values(
-            ["expected_value", "prob"],
-            ascending=[False, False]
+    if len(ev_pool):
+        value = ev_pool.sort_values(
+            ["expected_value", "prob"], ascending=False
         ).iloc[0]
     else:
-        best = tri.sort_values(
-            "prob", ascending=False
-        ).iloc[0]
-
-    best_prob = float(best["prob"])
-    best_odds = pd.to_numeric(
-        pd.Series([best.get("odds")]), errors="coerce"
-    ).iloc[0]
-    best_ev = pd.to_numeric(
-        pd.Series([best.get("expected_value")]), errors="coerce"
-    ).iloc[0]
+        value = safe
 
     has_full_odds = matched_odds >= 100
     historical_pass = bool(row["過去条件通過"])
 
+    value_ev = pd.to_numeric(pd.Series([value.get("expected_value")]), errors="coerce").iloc[0]
     reference_signal = bool(
         historical_pass
         and has_full_odds
-        and pd.notna(best_ev)
-        and float(best_ev) >= MIN_EV
-        and best_prob >= MIN_COMBO_PROB
+        and pd.notna(value_ev)
+        and float(value_ev) >= MIN_EV
+        and float(value["prob"]) >= MIN_COMBO_PROB
     )
-
-    real_candidate = bool(
-        gate["passed"] and reference_signal
-    )
+    real_candidate = bool(gate["passed"] and reference_signal)
 
     reasons = []
     if not gate["passed"]:
-        reasons.append("未見200件ゲート未合格")
+        if remaining_to_gate > 0:
+            reasons.append(f"未見200件まであと{remaining_to_gate}件")
+        else:
+            reasons.append("未見ゲート不合格")
     if not historical_pass:
         reasons.append("過去選別条件外")
     if not has_full_odds:
         reasons.append(f"実オッズ不足({matched_odds}/120)")
-    if pd.isna(best_ev):
+    if pd.isna(value_ev):
         reasons.append("期待値未計算")
-    elif float(best_ev) < MIN_EV:
+    elif float(value_ev) < MIN_EV:
         reasons.append("期待値1.05未満")
-    if best_prob < MIN_COMBO_PROB:
-        reasons.append("AI確率0.8%未満")
 
     race_rows.append({
         "race_id": rid,
@@ -330,14 +333,17 @@ for _, row in pool.iterrows():
         "締切": row["締切"],
         "残り分": float(row["残り分"]),
         "判断": "買い" if real_candidate else "見送り",
-        "買い目": str(best["combo"]),
-        "AI確率%": best_prob * 100,
-        "実オッズ": best_odds,
-        "期待値": best_ev,
+        "高確率買い目": str(safe["combo"]),
+        "高確率AI確率%": float(safe["prob"]) * 100,
+        "高確率オッズ": safe.get("odds", np.nan),
+        "高確率期待値": safe.get("expected_value", np.nan),
+        "高期待値買い目": str(value["combo"]),
+        "高期待値AI確率%": float(value["prob"]) * 100,
+        "高期待値オッズ": value.get("odds", np.nan),
+        "高期待値期待値": value_ev,
         "利益選別スコア": float(row["利益選別スコア"]),
-        "確信度": float(row["確信度"]),
-        "確率差": float(row["確率差"]),
         "取得組合せ数": matched_odds,
+        "オッズ更新": refresh_mode,
         "参考シグナル": reference_signal,
         "実戦候補": real_candidate,
         "判断理由": "全条件クリア" if real_candidate else " / ".join(reasons),
@@ -345,133 +351,105 @@ for _, row in pool.iterrows():
 
 races = pd.DataFrame(race_rows)
 
-# -------------------------
-# 購入判断を最上段に大きく表示
-# -------------------------
+# ---------------------------
+# Main purchase screen
+# ---------------------------
 st.divider()
 st.header("本日の購入判断")
 
-g1, g2, g3, g4 = st.columns(4)
-g1.metric("未見検証数", f'{gate["oos_bets"]:,} / 200')
-g2.metric("未見回収率", f'{gate["oos_roi"]*100:.1f}%')
-g3.metric("未見的中率", f'{gate["oos_hit_rate"]*100:.1f}%')
-g4.metric("黒字期間率", f'{gate["positive_fold_ratio"]*100:.1f}%')
+g1, g2, g3, g4, g5 = st.columns(5)
+g1.metric("未見検証数", f'{gate["oos_bets"]:,}/200')
+g2.metric("200件まで", f"{remaining_to_gate}件")
+g3.metric("未見回収率", f'{gate["oos_roi"]*100:.1f}%')
+g4.metric("未見的中率", f'{gate["oos_hit_rate"]*100:.1f}%')
+g5.metric("黒字期間率", f'{gate["positive_fold_ratio"]*100:.1f}%')
 
 if gate["passed"]:
-    st.success("実戦投入ゲート：合格")
+    st.success("実戦投入ゲート：合格。200件到達後の未見成績条件を満たしています。")
 else:
     st.error("実戦投入ゲート：未合格 → 現在は全レース『見送り』")
     st.caption("理由：" + " / ".join(gate["reasons"]))
 
 real = races[races["実戦候補"]].sort_values(
-    ["残り分", "期待値", "利益選別スコア"],
-    ascending=[True, False, False]
+    ["残り分", "高期待値期待値"], ascending=[True, False]
 )
 reference = races[races["参考シグナル"]].sort_values(
-    ["残り分", "期待値", "利益選別スコア"],
-    ascending=[True, False, False]
+    ["残り分", "高期待値期待値"], ascending=[True, False]
 )
-
-# 一番上に最大3件の大カード
 headline = real if len(real) else reference
 
 if headline.empty:
-    st.warning("現在、条件に近い買い目もありません。")
+    st.warning("現在、条件に近い参考候補もありません。")
 else:
-    st.subheader(
-        "購入候補" if len(real)
-        else "参考候補（ゲート未合格のため購入対象外）"
-    )
+    st.subheader("購入候補" if len(real) else "参考候補（ゲート外のため購入対象外）")
 
     for _, r in headline.head(3).iterrows():
         with st.container(border=True):
-            left, c2, c3, c4, c5, c6 = st.columns(
-                [1.2, 1.1, 1.1, 1.2, 1.2, 2.0]
-            )
-
-            with left:
-                if r["判断"] == "買い":
-                    st.success("## 買い")
-                else:
-                    st.warning("## 見送り")
-
-            c2.markdown(f"### {r['場']} {int(r['R'])}R")
-            c3.metric("締切まで", f"{r['残り分']:.0f}分")
-            c4.metric("実オッズ", f"{r['実オッズ']:.1f}倍" if pd.notna(r["実オッズ"]) else "未取得")
-            c5.metric("AI確率", f"{r['AI確率%']:.2f}%")
-            c6.markdown(f"## 買い目 **{r['買い目']}**")
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("期待値", f"{r['期待値']:.2f}" if pd.notna(r["期待値"]) else "—")
-            m2.metric("利益選別スコア", f"{r['利益選別スコア']:.1f}")
-            m3.metric("オッズ取得", f"{int(r['取得組合せ数'])}/120")
-
+            a,b,c,d,e = st.columns([1.1,1.1,1.1,1.2,1.5])
             if r["判断"] == "買い":
-                st.success("判断：買い　／　120通りの中で条件を満たす期待値上位買い目")
+                a.success("## 買い")
             else:
-                st.info("判断：見送り　／　" + r["判断理由"])
+                a.warning("## 見送り")
+            b.markdown(f"### {r['場']} {r['R']}R")
+            c.metric("締切まで", f"{r['残り分']:.0f}分")
+            d.metric("オッズ更新", r["オッズ更新"])
+            e.metric("取得", f"{r['取得組合せ数']}/120")
 
-# 参考候補一覧
-st.subheader("参考候補一覧")
-if reference.empty:
-    st.info("現在、参考候補はありません。")
-else:
-    show = reference.head(10).copy()
-    st.dataframe(
-        show[[
-            "判断","場","R","締切","残り分","買い目",
-            "AI確率%","実オッズ","期待値",
-            "取得組合せ数","利益選別スコア","判断理由"
-        ]],
-        use_container_width=True,
-        hide_index=True,
-    )
+            st.markdown("#### 高確率寄り")
+            x1,x2,x3,x4 = st.columns(4)
+            x1.metric("買い目", r["高確率買い目"])
+            x2.metric("AI確率", f"{r['高確率AI確率%']:.2f}%")
+            x3.metric("実オッズ", f"{r['高確率オッズ']:.1f}倍" if pd.notna(r["高確率オッズ"]) else "—")
+            x4.metric("期待値", f"{r['高確率期待値']:.2f}" if pd.notna(r["高確率期待値"]) else "—")
 
-# 全レース
+            st.markdown("#### 高期待値寄り")
+            y1,y2,y3,y4 = st.columns(4)
+            y1.metric("買い目", r["高期待値買い目"])
+            y2.metric("AI確率", f"{r['高期待値AI確率%']:.2f}%")
+            y3.metric("実オッズ", f"{r['高期待値オッズ']:.1f}倍" if pd.notna(r["高期待値オッズ"]) else "—")
+            y4.metric("期待値", f"{r['高期待値期待値']:.2f}" if pd.notna(r["高期待値期待値"]) else "—")
+
+            if r["残り分"] <= DIRECT_REFRESH_MINUTES:
+                st.info("締切30分以内：直前オッズを再取得して最終判定済み")
+            st.caption("判断理由：" + r["判断理由"])
+
+# All races table
 st.subheader("全評価レース")
-display = races.copy()
-display["残り分"] = display["残り分"].round(1)
-display["AI確率%"] = display["AI確率%"].round(3)
-display["実オッズ"] = pd.to_numeric(
-    display["実オッズ"], errors="coerce"
-).round(1)
-display["期待値"] = pd.to_numeric(
-    display["期待値"], errors="coerce"
-).round(3)
-
 st.dataframe(
-    display[[
-        "判断","場","R","締切","残り分","買い目",
-        "AI確率%","実オッズ","期待値",
-        "利益選別スコア","取得組合せ数","判断理由"
-    ]].sort_values(
-        ["判断","残り分"],
-        ascending=[True, True]
-    ),
+    races[[
+        "判断","場","R","締切","残り分",
+        "高確率買い目","高確率AI確率%","高確率オッズ","高確率期待値",
+        "高期待値買い目","高期待値AI確率%","高期待値オッズ","高期待値期待値",
+        "オッズ更新","取得組合せ数","判断理由"
+    ]].sort_values(["判断","残り分"], ascending=[True,True]),
     use_container_width=True,
-    hide_index=True,
+    hide_index=True
 )
 
-# -------------------------
-# 実戦ログ
-# -------------------------
+# ---------------------------
+# Logging: v2.10 separately tagged
+# ---------------------------
 ledger = load_ledger()
 
-# ledger.pyの既存仕様に合わせる列名へ変換
-real_for_log = real.rename(columns={
-    "買い目": "推奨3連単",
-    "AI確率%": "予測確率%",
-}).copy()
+# Log only real candidates, using high-EV pick as executed strategy candidate
+real_for_log = real.copy()
+real_for_log["推奨3連単"] = real_for_log["高期待値買い目"]
+real_for_log["予測確率%"] = real_for_log["高期待値AI確率%"]
+real_for_log["実オッズ"] = real_for_log["高期待値オッズ"]
+real_for_log["期待値"] = real_for_log["高期待値期待値"]
+# ledger expects confidence; keep selector score as available proxy if missing
+real_for_log["確信度"] = real_for_log["利益選別スコア"] / 100.0
 
 ledger = upsert_predictions(
     ledger,
     real_for_log,
     now.strftime("%Y-%m-%d %H:%M:%S"),
     stake_yen=100,
+    strategy_version=APP_VERSION,
 )
 
 pending_dates = ledger.loc[
-    ledger["status"] == "pending", "race_date"
+    ledger["status"]=="pending", "race_date"
 ].dropna().tolist()
 
 if pending_dates:
@@ -487,160 +465,138 @@ if pending_dates:
 
 save_ledger(ledger)
 
+# ---------------------------
+# ② separate v2.9.1+ performance
+# ---------------------------
 st.divider()
 st.header("実戦成績")
 
-settled = ledger[ledger["status"] == "settled"].copy()
-pending = ledger[ledger["status"] == "pending"].copy()
+settled_all = ledger[ledger["status"]=="settled"].copy()
 
-s1, s2, s3, s4 = st.columns(4)
-s1.metric("記録候補", f"{len(ledger):,}")
-s2.metric("結果確定", f"{len(settled):,}")
+# Since old files had no version tag, use recorded_at cutoff to isolate v2.9.1+
+recorded_dt = pd.to_datetime(ledger["recorded_at"], errors="coerce")
+v291_plus = ledger[recorded_dt >= V291_CUTOFF].copy()
+settled_v291 = v291_plus[v291_plus["status"]=="settled"].copy()
+pending_v291 = v291_plus[v291_plus["status"]=="pending"].copy()
 
-if len(settled):
-    hit = pd.to_numeric(
-        settled["hit"], errors="coerce"
-    ).fillna(False).astype(bool)
+def performance_metrics(df):
+    if df.empty:
+        return 0,0,0.0,0.0,0.0
+    settled = df[df["status"]=="settled"].copy()
+    if settled.empty:
+        return len(df),0,0.0,0.0,0.0
+    hits = pd.to_numeric(settled["hit"], errors="coerce").fillna(False).astype(bool)
+    stake = pd.to_numeric(settled["stake_yen"], errors="coerce").fillna(0).sum()
+    ret = pd.to_numeric(settled["return_yen"], errors="coerce").fillna(0).sum()
+    profit = pd.to_numeric(settled["profit_yen"], errors="coerce").fillna(0).sum()
+    return len(df),len(settled),float(hits.mean()),float(ret/stake if stake else 0),float(profit)
 
-    stake = pd.to_numeric(
-        settled["stake_yen"], errors="coerce"
-    ).fillna(0).sum()
+all_n,all_set,all_hit,all_roi,all_profit = performance_metrics(ledger)
+new_n,new_set,new_hit,new_roi,new_profit = performance_metrics(v291_plus)
 
-    ret = pd.to_numeric(
-        settled["return_yen"], errors="coerce"
-    ).fillna(0).sum()
+st.subheader("v2.9.1以降")
+m1,m2,m3,m4,m5 = st.columns(5)
+m1.metric("記録候補", f"{new_n}")
+m2.metric("結果確定", f"{new_set}")
+m3.metric("的中率", f"{new_hit*100:.1f}%")
+m4.metric("回収率", f"{new_roi*100:.1f}%")
+m5.metric("収支", f"{new_profit:+,.0f}円")
 
-    s3.metric("実戦的中率", f"{hit.mean()*100:.1f}%")
-    s4.metric(
-        "実戦回収率",
-        f"{(ret/stake*100 if stake else 0):.1f}%"
-    )
-else:
-    s3.metric("実戦的中率", "—")
-    s4.metric("実戦回収率", "—")
+with st.expander("旧バージョンを含む累計成績"):
+    a1,a2,a3,a4,a5 = st.columns(5)
+    a1.metric("記録候補", f"{all_n}")
+    a2.metric("結果確定", f"{all_set}")
+    a3.metric("的中率", f"{all_hit*100:.1f}%")
+    a4.metric("回収率", f"{all_roi*100:.1f}%")
+    a5.metric("収支", f"{all_profit:+,.0f}円")
 
-st.caption(f"結果待ち：{len(pending)}件")
-
-if len(settled):
+if not settled_v291.empty:
     st.dataframe(
-        settled.tail(30)[[
-            "race_date","venue","race_no",
-            "combo","pred_prob","odds","expected_value",
-            "actual_combo","actual_payout","hit",
-            "profit_yen","miss_type"
+        settled_v291.tail(30)[[
+            "race_date","venue","race_no","combo","pred_prob","odds",
+            "expected_value","actual_combo","actual_payout","hit","profit_yen",
+            "miss_type","strategy_version"
         ]],
         use_container_width=True,
-        hide_index=True,
+        hide_index=True
     )
+
+st.caption(
+    "旧ログにはstrategy_version列が無かったため、v2.9.1以降集計は "
+    "2026/08/11 11:09以降のrecorded_atを基準に分離しています。"
+)
 
 st.download_button(
     "成績CSVを保存",
     data=ledger.to_csv(index=False).encode("utf-8-sig"),
-    file_name="boatrace_ai_v291_performance.csv",
+    file_name="boatrace_ai_v210_performance.csv",
     mime="text/csv",
 )
 
-# -------------------------
-# 120通り詳細
-# -------------------------
+# ---------------------------
+# 120 details
+# ---------------------------
 st.divider()
 st.header("3連単120通り 詳細")
 
 if detail_map:
     detail_ids = list(detail_map.keys())
-
-    # オッズ一致数の多いレースを初期選択
     counts = {
-        rid: int(detail_map[rid]["odds"].notna().sum())
+        rid:int(detail_map[rid]["odds"].notna().sum())
         for rid in detail_ids
     }
     default_id = max(counts, key=counts.get)
-
     rid = st.selectbox(
         "レースを選択",
         detail_ids,
         index=detail_ids.index(default_id),
-        format_func=lambda x: (
-            f"{x}  （実オッズ {counts.get(x,0)}/120）"
-        ),
+        format_func=lambda x:f"{x}（実オッズ {counts.get(x,0)}/120）"
     )
 
     t = detail_map[rid].copy()
-
-    # EV順
-    t = t.sort_values(
-        ["expected_value", "prob"],
-        ascending=[False, False],
-        na_position="last",
-    )
-
-    # 条件を満たす行に判定ラベル
-    t["購入条件"] = np.where(
-        t["odds"].notna()
-        & (t["prob"] >= MIN_COMBO_PROB)
-        & (t["expected_value"] >= MIN_EV),
-        "候補",
-        "",
-    )
-
-    st.caption(
-        "各買い目について AI確率 × 実オッズ = 期待値。"
-        "AI確率0.8%以上を基本条件とし、その中で期待値の高い買い目を優先します。"
-    )
+    t["区分"] = ""
+    if len(t):
+        # mark high probability and high EV
+        valid_t = t[t["odds"].notna() & (t["prob"]>=MIN_COMBO_PROB)].copy()
+        if len(valid_t):
+            safe_idx = valid_t.sort_values(
+                ["prob","expected_value"], ascending=False
+            ).index[0]
+            value_idx = valid_t.sort_values(
+                ["expected_value","prob"], ascending=False
+            ).index[0]
+            t.loc[safe_idx,"区分"] = "高確率"
+            t.loc[value_idx,"区分"] = (
+                "高確率・高期待値"
+                if value_idx == safe_idx else "高期待値"
+            )
 
     st.dataframe(
-        t[[
-            "購入条件","combo","prob_pct",
-            "odds","expected_value"
-        ]],
+        t.sort_values(
+            ["expected_value","prob"], ascending=False, na_position="last"
+        )[["区分","combo","prob_pct","odds","expected_value"]],
         use_container_width=True,
-        hide_index=True,
+        hide_index=True
     )
 
-# -------------------------
-# 検証情報
-# -------------------------
 with st.expander("AI検証・現在の選別条件"):
-    v1, v2, v3, v4 = st.columns(4)
-    v1.metric("元AI検証数", f'{base_stats["races"]:,}')
-    v2.metric("元AI回収率", f'{base_stats["roi"]*100:.1f}%')
-    v3.metric("未見選別数", f'{selector_metrics.get("races",0):,}')
-    v4.metric("未見選別回収率", f'{selector_metrics.get("roi",0)*100:.1f}%')
-
     if folds is not None and not folds.empty:
-        st.dataframe(
-            folds[[
-                "test_start","test_end","test_bets",
-                "test_hit_rate","test_roi","test_profit",
-                "train_bets","train_roi","train_shrunk_roi"
-            ]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    if current_rule:
-        st.write({
-            "最低AI確率%":
-                round(float(current_rule.get("min_prob") or 0)*100, 3),
-            "最低確率差%":
-                round(float(current_rule.get("min_margin") or 0)*100, 3),
-            "最低確信度":
-                round(float(current_rule.get("min_conf") or 0), 4),
-            "1着艇限定":
-                current_rule.get("first_lane") or "なし",
-            "R下限":
-                current_rule.get("race_no_min") or "なし",
-            "R上限":
-                current_rule.get("race_no_max") or "なし",
-        })
+        st.dataframe(folds, use_container_width=True, hide_index=True)
+    st.write({
+        "未見検証件数": gate["oos_bets"],
+        "200件まで残り": remaining_to_gate,
+        "未見回収率%": round(gate["oos_roi"]*100,1),
+        "黒字期間率%": round(gate["positive_fold_ratio"]*100,1),
+        "ゲート合格": gate["passed"],
+    })
 
 st.subheader("AI再学習")
 if st.button("最新結果で再学習する"):
     st.cache_data.clear()
     st.cache_resource.clear()
-    st.success("キャッシュをクリアしました。ページ再読込で最新結果を反映します。")
+    st.success("キャッシュをクリアしました。再読込で最新結果を反映します。")
 
 st.caption(
     "購入判断支援用です。的中・利益を保証しません。"
-    "未見検証ゲート不合格時は、期待値が高くても『見送り』です。"
+    "締切30分以内は直前オッズを再取得します。"
 )
