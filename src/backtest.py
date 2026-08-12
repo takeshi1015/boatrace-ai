@@ -175,7 +175,99 @@ def optimize_rule(train, min_bets=100):
 
     return best, best_stats
 
-def nested_selector_backtest(preds, lookback_days=28, step_days=7, min_bets=100):
+def _date_window(df, days=None):
+    if df is None or df.empty or days is None:
+        return df.copy() if df is not None else pd.DataFrame()
+    x=df.copy()
+    d=pd.to_datetime(x.get("race_date"),errors="coerce")
+    if not d.notna().any():
+        return x
+    cutoff=d.max()-pd.Timedelta(days=int(days)-1)
+    return x[d>=cutoff].copy()
+
+
+def _rule_key(rule):
+    if rule is None:return None
+    return tuple((k,rule.get(k)) for k in sorted(rule))
+
+
+def optimize_rule_temporal(train, windows=(30,90,180,None), min_bets=100):
+    """Choose a rule that survives multiple historical horizons.
+
+    Recent windows receive more weight, but a rule is penalized when it only
+    works in one short slice.  All decisions are based on past data only.
+    """
+    if train is None or train.empty:
+        return None, {}
+    t=train.copy()
+    t["date_dt"]=pd.to_datetime(t.get("race_date"),errors="coerce")
+    t=t[t["date_dt"].notna()].sort_values("date_dt")
+    if t.empty:return None,{}
+
+    # Find promising rules independently in each horizon, then compare the
+    # small candidate set across every available horizon. This is materially
+    # cheaper and less overfit than searching the full grid four times jointly.
+    candidates=[]
+    horizon_defs=[]
+    for w in windows:
+        x=_date_window(t,w)
+        if x.empty:continue
+        # Short windows need a smaller minimum to remain usable.
+        mb=max(35,min(min_bets,int(max(35,len(x)*0.06))))
+        rule,stats=optimize_rule(x,min_bets=mb)
+        if rule is not None:
+            candidates.append(rule)
+        horizon_defs.append((w,x))
+    if not candidates:
+        return optimize_rule(t,min_bets=min_bets)
+
+    unique={_rule_key(r):r for r in candidates}
+    weights={30:0.45,90:0.30,180:0.15,None:0.10}
+    best=None;best_stats={};best_score=-1e9
+    for rule in unique.values():
+        rows=[];score=0.0;used_w=0.0;loss_penalty=0.0
+        for w,x in horizon_defs:
+            chosen=_apply_rule(x,rule)
+            n=len(chosen)
+            if n<20:
+                continue
+            ss=summarize(chosen)
+            # Shrink strongly toward break-even to prevent a small lucky sample
+            # from dominating the current strategy.
+            prior=180.0 if w in (30,90) else 250.0
+            shr=(ss["roi"]*n+1.0*prior)/(n+prior)
+            ww=weights.get(w,0.10)
+            used_w+=ww
+            score += ww*((shr-1.0)*100.0)
+            if ss["roi"]<0.90:
+                loss_penalty += ww*(0.90-ss["roi"])*60.0
+            rows.append({"window_days":"all" if w is None else int(w),"bets":n,"roi":ss["roi"],"hit_rate":ss["hit_rate"],"shrunk_roi":shr,"profit":ss["profit"]})
+        if used_w<=0:continue
+        score=score/used_w-loss_penalty
+        # reward stability, not isolated jackpots
+        profitable=sum(1 for r in rows if r["roi"]>1.0)
+        score += 0.7*profitable
+        if score>best_score:
+            best_score=score;best=rule
+            allstats=summarize(_apply_rule(t,rule))
+            best_stats=allstats|{"temporal_score":score,"window_stats":rows,"profitable_windows":profitable,"available_windows":len(rows)}
+    if best is None:
+        return optimize_rule(t,min_bets=min_bets)
+    return best,best_stats
+
+
+def temporal_profit_summary(df):
+    """ROI/hit/profit by 30/90/180/all unseen periods for UI and gating."""
+    if df is None or df.empty:return pd.DataFrame()
+    rows=[]
+    for w in (30,90,180,None):
+        x=_date_window(df,w)
+        if x.empty:continue
+        s=summarize(x)
+        rows.append({"期間":"全期間" if w is None else f"直近{w}日","件数":s["races"],"的中率":s["hit_rate"],"回収率":s["roi"],"損益":s["profit"]})
+    return pd.DataFrame(rows)
+
+def nested_selector_backtest(preds, lookback_days=180, step_days=7, min_bets=100, min_selector_days=35):
     if preds is None or preds.empty:
         return pd.DataFrame(), {}, pd.DataFrame()
 
@@ -189,7 +281,7 @@ def nested_selector_backtest(preds, lookback_days=28, step_days=7, min_bets=100)
     eval_rows = []
     fold_rows = []
 
-    for i in range(lookback_days, len(dates), step_days):
+    for i in range(min_selector_days, len(dates), step_days):
         test_dates = dates[i:i+step_days]
         if not test_dates:
             break
@@ -197,7 +289,7 @@ def nested_selector_backtest(preds, lookback_days=28, step_days=7, min_bets=100)
         train = p[p["date_dt"].dt.normalize().isin(train_dates)]
         test = p[p["date_dt"].dt.normalize().isin(test_dates)]
 
-        rule, train_stats = optimize_rule(train, min_bets=min_bets)
+        rule, train_stats = optimize_rule_temporal(train, min_bets=min_bets)
         if rule is None:
             continue
 
@@ -210,7 +302,10 @@ def nested_selector_backtest(preds, lookback_days=28, step_days=7, min_bets=100)
             **rule,
             "train_bets": train_stats.get("races",0),
             "train_roi": train_stats.get("roi",0),
-            "train_shrunk_roi": train_stats.get("shrunk_roi",0),
+            "train_shrunk_roi": train_stats.get("shrunk_roi",train_stats.get("roi",0)),
+            "temporal_score": train_stats.get("temporal_score",0),
+            "profitable_windows": train_stats.get("profitable_windows",0),
+            "available_windows": train_stats.get("available_windows",0),
             "test_bets": test_stats.get("races",0),
             "test_hit_rate": test_stats.get("hit_rate",0),
             "test_roi": test_stats.get("roi",0),
@@ -269,7 +364,7 @@ def deployment_gate(metrics, folds,
         "valid_folds": len(valid_folds),
     }
 
-def fit_current_selector(preds, lookback_days=35, min_bets=120):
+def fit_current_selector(preds, lookback_days=180, min_bets=120):
     if preds is None or preds.empty:
         return None, {}
     p = preds.copy()
@@ -280,7 +375,7 @@ def fit_current_selector(preds, lookback_days=35, min_bets=120):
         return None, {}
     keep = dates[-min(lookback_days, len(dates)):]
     train = p[p["date_dt"].dt.normalize().isin(keep)]
-    return optimize_rule(train, min_bets=min_bets)
+    return optimize_rule_temporal(train, min_bets=min_bets)
 
 def current_buy_score(race_row, rule):
     if rule is None:

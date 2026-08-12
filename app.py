@@ -6,18 +6,18 @@ import streamlit as st
 
 from src.data import fetch_today,flatten,historical_dataset,fetch_results_for_dates
 from src.model import fit_models,trifecta_table,selection_signals,race_data_quality
-from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize
+from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize,temporal_profit_summary
 from src.calibration import fit_probability_calibrator,calibrate_distribution,fit_ticket_calibrators,calibrate_ticket_table,ticket_reliability_gate
 from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticket_candidates,priority_candidate,TICKET_NAMES
 from src.context_reliability import fit_context_reliability,current_race_context,context_factor,apply_context_factor,apply_market_overlay
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.12.0'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.0'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-st.set_page_config(page_title='BOAT RACE AI v2.12.0',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.13.0',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.12.0：予測精度・学習能力強化（直近重み＋実績事前分布＋展示データ品質ゲート）')
+st.caption('v2.13.0：時系列適応・利益学習強化（30/90/180日＋長期を自動比較）')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2=st.columns([4,1])
@@ -25,16 +25,16 @@ c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
 if c2.button('最新データに更新',use_container_width=True):
     st.cache_data.clear();st.cache_resource.clear();st.rerun()
 
-@st.cache_data(ttl=21600,show_spinner='過去120日データを再構築しています…')
-def load_hist():return historical_dataset(120)
+@st.cache_data(ttl=21600,show_spinner='長期学習データを再構築しています…')
+def load_hist():return historical_dataset(220)
 @st.cache_resource(ttl=21600,show_spinner='最新結果を含めAIを再学習しています…')
 def load_models():return fit_models(load_hist())
 @st.cache_data(ttl=21600,show_spinner='未見データ検証と確率校正を更新しています…')
 def learning_assets():
-    preds=generate_walk_forward_predictions(load_hist(),min_train_days=35,test_days=7,max_test_days=56)
-    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=28,step_days=7,min_bets=100)
+    preds=generate_walk_forward_predictions(load_hist(),min_train_days=40,test_days=14,max_test_days=175)
+    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=180,step_days=7,min_bets=90,min_selector_days=35)
     gate=deployment_gate(metrics,folds,min_oos_bets=200,min_oos_roi=1.00,min_positive_fold_ratio=0.60,min_recent_fold_ratio=0.50)
-    rule,rstats=fit_current_selector(preds,lookback_days=35,min_bets=120)
+    rule,rstats=fit_current_selector(preds,lookback_days=180,min_bets=100)
     calibrator,cstats=fit_probability_calibrator(preds)
     ticket_calibrators,ticket_stats=fit_ticket_calibrators(preds)
     ticket_gate=ticket_reliability_gate(ticket_stats,min_samples=200)
@@ -50,6 +50,7 @@ hist=load_hist();models=load_models()
 if models is None:st.error('AIモデルを作成できませんでした。');st.stop()
 preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate,context_stats=learning_assets()
 base_stats=summarize(preds)
+temporal_stats=temporal_profit_summary(selector_bt)
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 
 st.header('本日の状態')
@@ -62,6 +63,9 @@ if gate['passed']:
     st.success('実戦投入ゲート：合格')
 else:
     st.warning('実戦投入ゲート：未合格。現在は「見送り」を優先してください。 理由：'+' / '.join(gate['reasons']))
+with st.expander('未見回収率とは？',expanded=False):
+    st.write('AIが学習に使っていない未来側の期間だけで、過去時点の予想を再現して100円ずつ購入したと仮定した回収率です。100%が損益分岐、100%未満は赤字、100%超はその未見検証期間では黒字です。')
+    st.caption('例：未見回収率85.2%なら、仮に10,000円購入した検証で約8,520円戻った水準を意味します。将来の利益を保証する数字ではありません。')
 
 with st.expander('学習状況・券種別信頼度・条件別弱点（詳細）',expanded=False):
     st.subheader('自己学習状況')
@@ -74,6 +78,16 @@ with st.expander('学習状況・券種別信頼度・条件別弱点（詳細�
     if cal_stats.get('brier_raw') is not None:
         delta=cal_stats['brier_raw']-cal_stats['brier_cal']
         st.caption(f"確率校正 Brier: 校正前 {cal_stats['brier_raw']:.4f} → 校正後 {cal_stats['brier_cal']:.4f}（改善 {delta:+.4f}）")
+    st.subheader('時系列・利益学習')
+    if temporal_stats is not None and not temporal_stats.empty:
+        ts=temporal_stats.copy()
+        ts['的中率']=ts['的中率'].map(lambda x:f'{x*100:.1f}%')
+        ts['回収率']=ts['回収率'].map(lambda x:f'{x*100:.1f}%')
+        ts['損益']=ts['損益'].map(lambda x:f'{x:,.0f}円')
+        st.dataframe(ts,use_container_width=True,hide_index=True)
+        st.caption('直近30日を最重視しつつ、90日・180日・長期でも崩れない購入条件を優先します。短期だけ偶然黒字の条件は採用しにくくしています。')
+    if isinstance(current_stats,dict) and current_stats.get('window_stats'):
+        st.caption('現在ルールの期間別検証: '+ ' / '.join([f"{x['window_days']}日: {x['bets']}件 ROI{x['roi']*100:.1f}%" for x in current_stats['window_stats']]))
     st.subheader('券種別の未見確率信頼度')
     rg=st.columns(4)
     for i,code in enumerate(('3t','3f','2t','2f')):
@@ -293,4 +307,4 @@ with st.expander('学習・校正・未見検証の詳細'):
 st.subheader('AI再学習')
 if st.button('最新結果で再学習する'):
     st.cache_data.clear();st.cache_resource.clear();st.success('キャッシュを消去しました。再読込すると公開済み最新結果まで含めて再学習します。')
-st.caption('v2.11.4は「買い候補→全レース1行一覧→詳細」の順に整理した購入判断1画面完成版です。予測ロジックはv2.11.2を維持しています。')
+st.caption('v2.13.0は30/90/180日・長期の未見成績を同時評価し、直近を重くしつつ複数期間で安定した利益条件だけを現在ルールへ採用します。')
