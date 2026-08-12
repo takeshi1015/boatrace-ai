@@ -7,16 +7,16 @@ import streamlit as st
 from src.data import fetch_today,flatten,historical_dataset,fetch_results_for_dates
 from src.model import fit_models,trifecta_table,selection_signals
 from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize
-from src.calibration import fit_probability_calibrator,calibrate_distribution
+from src.calibration import fit_probability_calibrator,calibrate_distribution,fit_ticket_calibrators,calibrate_ticket_table,ticket_reliability_gate
 from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticket_candidates,priority_candidate,TICKET_NAMES
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11'
-DIRECT_REFRESH_MINUTES=30; MIN_EV=1.05
-st.set_page_config(page_title='BOAT RACE AI v2.11',layout='wide')
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11.1'
+DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
+st.set_page_config(page_title='BOAT RACE AI v2.11.1',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.11：日次自己学習・確率校正・3連単/3連複/2連単/2連複 自動比較')
+st.caption('v2.11.1：券種別未見確率校正・過大EV抑制・信頼券種だけを候補化')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2=st.columns([4,1])
@@ -35,7 +35,9 @@ def learning_assets():
     gate=deployment_gate(metrics,folds,min_oos_bets=200,min_oos_roi=1.00,min_positive_fold_ratio=0.60,min_recent_fold_ratio=0.50)
     rule,rstats=fit_current_selector(preds,lookback_days=35,min_bets=120)
     calibrator,cstats=fit_probability_calibrator(preds)
-    return preds,selected,metrics,folds,gate,rule,rstats,calibrator,cstats
+    ticket_calibrators,ticket_stats=fit_ticket_calibrators(preds)
+    ticket_gate=ticket_reliability_gate(ticket_stats,min_samples=200)
+    return preds,selected,metrics,folds,gate,rule,rstats,calibrator,cstats,ticket_calibrators,ticket_stats,ticket_gate
 
 try: today=flatten(fetch_today(),False)
 except Exception:
@@ -44,7 +46,7 @@ if today.empty:st.warning('本日のレースデータがありません。');st
 
 hist=load_hist();models=load_models()
 if models is None:st.error('AIモデルを作成できませんでした。');st.stop()
-preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats=learning_assets()
+preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate=learning_assets()
 base_stats=summarize(preds)
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 
@@ -62,6 +64,19 @@ else:st.caption('確率校正はサンプル蓄積中です。')
 if gate['passed']:st.success('実戦投入ゲート：合格')
 else:st.warning('実戦投入ゲート：未合格。試験候補は表示しますが、購入判断は慎重にしてください。 理由：'+' / '.join(gate['reasons']))
 
+st.subheader('券種別の未見確率信頼度')
+rg=st.columns(4)
+for i,code in enumerate(('3t','3f','2t','2f')):
+    g=ticket_gate.get(code,{})
+    stat=ticket_stats.get(code,{})
+    name=TICKET_NAMES[code]
+    hr=stat.get('hit_rate'); mp=stat.get('mean_pred')
+    label='信頼可' if g.get('passed') else '試験中'
+    rg[i].metric(name,label,delta=f"未見 {g.get('samples',0)}件")
+    if hr is not None and mp is not None:
+        rg[i].caption(f"予測平均 {mp*100:.1f}% / 実的中 {hr*100:.1f}% / 安全係数 {stat.get('safe_factor',1.0):.2f}")
+    if g.get('reasons'): rg[i].caption('・'.join(g['reasons']))
+
 # Times
 dt=pd.to_datetime(today['closed_at'],errors='coerce')
 if dt.dt.tz is None:dt=dt.dt.tz_localize(JST,nonexistent='shift_forward',ambiguous='NaT')
@@ -76,7 +91,9 @@ for rid,g in valid.groupby('race_id'):
         tri=calibrate_distribution(raw,calibrator)
         sig=selection_signals(tri);top=tri.iloc[0]
         score,rule_pass=current_buy_score({'確率1位%':float(top['prob']*100),'確率差':float(sig['prob_margin']),'確信度':float(sig['confidence']),'確率1位':str(top['combo']),'R':int(g['race_no'].iloc[0])},current_rule)
-        rid=str(rid);race_groups[rid]=g.copy();prob_tables[rid]=probability_tables_from_trifecta(tri)
+        rid=str(rid);race_groups[rid]=g.copy()
+        raw_ticket_tables=probability_tables_from_trifecta(tri)
+        prob_tables[rid]={code:calibrate_ticket_table(df,code,ticket_calibrators,ticket_stats) for code,df in raw_ticket_tables.items()}
         base_rows.append({'race_id':rid,'race_date':g['race_date'].iloc[0],'場':g['venue'].iloc[0],'R':int(g['race_no'].iloc[0]),'締切':pd.Timestamp(g['closed_at_jst'].iloc[0]).strftime('%H:%M'),'残り分':float(g['minutes_left'].iloc[0]),'AI1位':top['combo'],'校正AI確率%':float(top['prob']*100),'利益選別スコア':float(score),'過去条件通過':bool(rule_pass),'確信度':float(sig['confidence'])})
     except Exception:pass
 base=pd.DataFrame(base_rows)
@@ -108,10 +125,16 @@ for _,r in pool.iterrows():
     merged={}
     for code,pdf in prob_tables[rid].items():merged[code]=merge_odds(pdf,odds.get(code,pd.DataFrame(columns=['combo','odds'])))
     details[rid]=merged
-    safe,value=choose_ticket_candidates(merged);priority,priority_reason=priority_candidate(safe,value)
-    if priority is None:continue
+    reliable={code:df for code,df in merged.items() if ticket_gate.get(code,{}).get('passed')}
+    candidate_source=reliable if reliable else {}
+    safe,value=choose_ticket_candidates(candidate_source);priority,priority_reason=priority_candidate(safe,value)
+    if priority is None:
+        # No ticket type has enough OOS probability reliability yet. Keep the race in details only.
+        continue
     complete=sum(int(merged[c]['odds'].notna().sum()>0) for c in merged)
-    reference=bool(r['過去条件通過'] and pd.notna(priority.get('expected_value')) and float(priority['expected_value'])>=MIN_EV)
+    pcode=priority.get('ticket_code')
+    tgate=ticket_gate.get(pcode,{})
+    reference=bool(r['過去条件通過'] and tgate.get('passed') and pd.notna(priority.get('expected_value')) and float(priority['expected_value'])>=MIN_EV)
     final_buy=bool(gate['passed'] and reference)
     def fields(x,prefix):
         if x is None:return {prefix+'券種':'—',prefix+'買い目':'—',prefix+'確率%':np.nan,prefix+'オッズ':np.nan,prefix+'期待値':np.nan}
@@ -123,7 +146,7 @@ races=pd.DataFrame(race_rows)
 st.divider();st.header('本日の券種・買い目判断')
 if races.empty:st.warning('実オッズまで揃った候補がありません。');st.stop()
 headline=races[races['参考候補']].sort_values(['残り分','優先期待値'],ascending=[True,False])
-if headline.empty:st.warning('現在、期待値1.05以上かつ過去選別条件を満たす試験候補はありません。')
+if headline.empty:st.warning('現在、安全補正期待値1.10以上・過去選別条件・券種信頼度をすべて満たす候補はありません。')
 else:
     for _,r in headline.head(5).iterrows():
         with st.container(border=True):
@@ -134,9 +157,9 @@ else:
             d.metric('優先券種',r['優先券種'])
             e.markdown(f"### {r['優先買い目']}")
             st.markdown('#### 高確率寄り')
-            x1,x2,x3,x4=st.columns(4);x1.metric('券種',r['高確率券種']);x2.metric('買い目',r['高確率買い目']);x3.metric('AI確率',f"{r['高確率確率%']:.2f}%");x4.metric('期待値',f"{r['高確率期待値']:.2f}" if pd.notna(r['高確率期待値']) else '—')
+            x1,x2,x3,x4=st.columns(4);x1.metric('券種',r['高確率券種']);x2.metric('買い目',r['高確率買い目']);x3.metric('安全補正AI確率',f"{r['高確率確率%']:.2f}%");x4.metric('期待値',f"{r['高確率期待値']:.2f}" if pd.notna(r['高確率期待値']) else '—')
             st.markdown('#### 高期待値寄り')
-            y1,y2,y3,y4=st.columns(4);y1.metric('券種',r['高期待値券種']);y2.metric('買い目',r['高期待値買い目']);y3.metric('AI確率',f"{r['高期待値確率%']:.2f}%");y4.metric('期待値',f"{r['高期待値期待値']:.2f}" if pd.notna(r['高期待値期待値']) else '—')
+            y1,y2,y3,y4=st.columns(4);y1.metric('券種',r['高期待値券種']);y2.metric('買い目',r['高期待値買い目']);y3.metric('安全補正AI確率',f"{r['高期待値確率%']:.2f}%");y4.metric('期待値',f"{r['高期待値期待値']:.2f}" if pd.notna(r['高期待値期待値']) else '—')
             st.info(f"優先：{r['優先券種']} {r['優先買い目']} ／ {r['優先理由']} ／ 実オッズ {r['優先オッズ']:.1f}倍 ／ EV {r['優先期待値']:.2f}")
             if r['オッズ更新']=='直前再取得':st.caption('締切30分以内のため直前オッズで再判定')
 
@@ -158,14 +181,16 @@ rid=st.selectbox('レースを選択',list(details.keys()),format_func=lambda x:
 for code in ('3t','3f','2t','2f'):
     df=details[rid][code].copy().sort_values(['expected_value','prob'],ascending=False,na_position='last')
     with st.expander(f"{TICKET_NAMES[code]}（{int(df['odds'].notna().sum())}/{len(df)} オッズ取得）",expanded=(code!='3t')):
-        show=df.head(30).copy();show['AI確率']=show['prob_pct'].map(lambda x:f'{x:.3f}%');show['実オッズ']=show['odds'].map(lambda x:f'{x:.1f}倍' if pd.notna(x) else '—');show['期待値']=show['expected_value'].map(lambda x:f'{x:.3f}' if pd.notna(x) else '—')
-        st.dataframe(show[['combo','AI確率','実オッズ','期待値']],use_container_width=True,hide_index=True)
+        show=df.head(30).copy();show['安全補正AI確率']=show['prob_pct'].map(lambda x:f'{x:.3f}%');show['実オッズ']=show['odds'].map(lambda x:f'{x:.1f}倍' if pd.notna(x) else '—');show['安全補正期待値']=show['expected_value'].map(lambda x:f'{x:.3f}' if pd.notna(x) else '—')
+        if 'effective_factor' in show: show['安全係数']=show['effective_factor'].map(lambda x:f'{x:.3f}')
+        cols=['combo','安全補正AI確率','実オッズ','安全補正期待値']+(['安全係数'] if '安全係数' in show else [])
+        st.dataframe(show[cols],use_container_width=True,hide_index=True)
 
 with st.expander('学習・校正・未見検証の詳細'):
-    st.write({'学習最新日':latest_date,'学習レース数':int(hist['race_id'].nunique()),'未見検証数':gate['oos_bets'],'未見回収率%':round(gate['oos_roi']*100,1),'未見的中率%':round(gate['oos_hit_rate']*100,1),'ゲート':gate['passed'],'校正サンプル':cal_stats.get('samples',0),'Brier校正前':cal_stats.get('brier_raw'),'Brier校正後':cal_stats.get('brier_cal')})
+    st.write({'学習最新日':latest_date,'学習レース数':int(hist['race_id'].nunique()),'未見検証数':gate['oos_bets'],'未見回収率%':round(gate['oos_roi']*100,1),'未見的中率%':round(gate['oos_hit_rate']*100,1),'ゲート':gate['passed'],'3連単校正サンプル':ticket_stats.get('3t',{}).get('samples',0),'3連複校正サンプル':ticket_stats.get('3f',{}).get('samples',0),'2連単校正サンプル':ticket_stats.get('2t',{}).get('samples',0),'2連複校正サンプル':ticket_stats.get('2f',{}).get('samples',0)})
     if folds is not None and not folds.empty:st.dataframe(folds,use_container_width=True,hide_index=True)
 
 st.subheader('AI再学習')
 if st.button('最新結果で再学習する'):
     st.cache_data.clear();st.cache_resource.clear();st.success('キャッシュを消去しました。再読込すると公開済み最新結果まで含めて再学習します。')
-st.caption('v2.11は公開済み過去結果を毎回再取得して学習履歴を再構築するため、Streamlitの一時ファイルが消えても学習本体は失われません。実オッズ未取得項目は推測しません。予測・利益を保証するものではありません。')
+st.caption('v2.11.1は券種別に未見予測確率と実的中率を照合し、過大評価分とサンプル不足を安全係数で差し引いてから期待値を計算します。未見回収率ゲート不合格時は実戦購入候補を出しません。')

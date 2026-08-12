@@ -2,6 +2,7 @@ from __future__ import annotations
 import itertools
 import pandas as pd
 from .model import fit_models, trifecta_table, selection_signals
+from .tickets import probability_tables_from_trifecta
 
 def generate_walk_forward_predictions(hist, min_train_days=35, test_days=7, max_test_days=49):
     if hist is None or hist.empty:
@@ -41,6 +42,24 @@ def generate_walk_forward_predictions(hist, min_train_days=35, test_days=7, max_
                 act = str(actual.iloc[0])
                 hit = pred == act
                 pay = float(payout.iloc[0]) if len(payout) else 0.0
+                ticket_tables = probability_tables_from_trifecta(tri)
+                aa = tuple(int(x) for x in act.split("-"))
+                actual_map = {
+                    "3t": act,
+                    "3f": "-".join(map(str, sorted(aa))),
+                    "2t": f"{aa[0]}-{aa[1]}",
+                    "2f": "-".join(map(str, sorted(aa[:2]))),
+                }
+                ticket_extra = {}
+                for code, tdf in ticket_tables.items():
+                    if tdf is None or tdf.empty:
+                        continue
+                    tt = tdf.iloc[0]
+                    tpred = str(tt["combo"])
+                    ticket_extra[f"{code}_pred"] = tpred
+                    ticket_extra[f"{code}_prob"] = float(tt["prob"])
+                    ticket_extra[f"{code}_hit"] = bool(tpred == actual_map[code])
+
                 rows.append({
                     "race_id": rid,
                     "race_date": str(g["race_date"].iloc[0])[:10],
@@ -58,6 +77,7 @@ def generate_walk_forward_predictions(hist, min_train_days=35, test_days=7, max_
                     "stake": 100.0,
                     "return_yen": pay if hit else 0.0,
                     "profit_yen": (pay if hit else 0.0) - 100.0,
+                    **ticket_extra,
                 })
             except Exception:
                 pass
