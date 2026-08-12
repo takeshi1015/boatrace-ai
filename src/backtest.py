@@ -50,6 +50,20 @@ def generate_walk_forward_predictions(hist, min_train_days=35, test_days=7, max_
                     "2t": f"{aa[0]}-{aa[1]}",
                     "2f": "-".join(map(str, sorted(aa[:2]))),
                 }
+                # Context fields are stored on every walk-forward prediction so
+                # venue / lane-1 / race-number / weather strengths and weaknesses
+                # are learned only from races the model had not seen.
+                lane1_first_prob=float(tri.loc[tri['combo'].astype(str).str.startswith('1-'),'prob'].sum())
+                def _first_num(col):
+                    try:
+                        return float(pd.to_numeric(g[col],errors='coerce').dropna().iloc[0])
+                    except Exception:
+                        return None
+                context_extra={
+                    'lane1_first_prob':lane1_first_prob,
+                    'wind_speed':_first_num('wind_speed'),
+                    'wave_height_cm':_first_num('wave_height_cm'),
+                }
                 ticket_extra = {}
                 for code, tdf in ticket_tables.items():
                     if tdf is None or tdf.empty:
@@ -77,6 +91,7 @@ def generate_walk_forward_predictions(hist, min_train_days=35, test_days=7, max_
                     "stake": 100.0,
                     "return_yen": pay if hit else 0.0,
                     "profit_yen": (pay if hit else 0.0) - 100.0,
+                    **context_extra,
                     **ticket_extra,
                 })
             except Exception:
