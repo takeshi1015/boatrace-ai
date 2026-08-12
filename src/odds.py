@@ -313,3 +313,134 @@ def fetch_trifecta_odds(date_yyyymmdd, venue, race_no, timeout=8):
             return df, urls[0], diagnostics
 
     return empty_odds(), urls[0] if urls else None, diagnostics
+
+# ===== v2.11 multi-ticket odds =====
+TICKET_TARGETS={'3f':20,'2t':30,'2f':15}
+
+def _official_ticket_url(date_yyyymmdd,venue,race_no,path,host='www.boatrace.jp'):
+    jcd=JCD.get(venue)
+    if not jcd: return None
+    qs=urlencode({'hd':date_yyyymmdd,'jcd':jcd,'rno':int(race_no)})
+    return f'https://{host}/owpc/pc/race/{path}?{qs}'
+
+def _matrix_to_3f(matrix):
+    if not matrix:return {}
+    width=max((len(r) for r in matrix),default=0); best={}
+    for start in range(max(1,width-12+1)):
+        found={}
+        for row in matrix:
+            if len(row)<start+12:continue
+            for block in range(4):
+                base=start+block*3; first=block+1
+                second=_boat(row[base]); third=_boat(row[base+1]); odd=_odd(row[base+2])
+                if second and third and odd and first<second<third:
+                    found[f'{first}-{second}-{third}']=odd
+        if len(found)>len(best):best=found
+    return best
+
+def _matrix_to_2t(matrix):
+    if not matrix:return {}
+    width=max((len(r) for r in matrix),default=0); best={}
+    for start in range(max(1,width-12+1)):
+        found={}
+        for row in matrix:
+            if len(row)<start+12:continue
+            for block in range(6):
+                base=start+block*2; first=block+1
+                second=_boat(row[base]); odd=_odd(row[base+1])
+                if second and odd and first!=second:
+                    found[f'{first}-{second}']=odd
+        if len(found)>len(best):best=found
+    return best
+
+def _matrix_to_2f(matrix):
+    if not matrix:return {}
+    width=max((len(r) for r in matrix),default=0); best={}
+    for start in range(max(1,width-10+1)):
+        found={}
+        for row in matrix:
+            if len(row)<start+10:continue
+            for block in range(5):
+                base=start+block*2; first=block+1
+                second=_boat(row[base]); odd=_odd(row[base+1])
+                if second and odd and first<second:
+                    found[f'{first}-{second}']=odd
+        if len(found)>len(best):best=found
+    return best
+
+def _heading_table(soup,heading):
+    for tag in soup.find_all(['h2','h3','h4','div','p']):
+        if heading in _clean_text(tag.get_text(' ',strip=True)):
+            return tag.find_next('table')
+    return None
+
+def _parse_ticket_html(html,code):
+    soup=BeautifulSoup(html,'lxml')
+    heading={'3f':'3連複オッズ','2t':'2連単オッズ','2f':'2連複オッズ'}[code]
+    table=_heading_table(soup,heading)
+    parser={'3f':_matrix_to_3f,'2t':_matrix_to_2t,'2f':_matrix_to_2f}[code]
+    best={}
+    candidates=[table] if table is not None else []
+    candidates+=soup.find_all('table')
+    seen=set()
+    for t in candidates:
+        if t is None or id(t) in seen:continue
+        seen.add(id(t)); found=parser(_expand_table(t))
+        if len(found)>len(best):best=found
+        if len(best)>=TICKET_TARGETS[code]:break
+    return best,{'heading':heading,'tables':len(soup.find_all('table')),'parsed_count':len(best)}
+
+def _markdown_matrix(text,heading):
+    lines=text.splitlines(); start=None
+    for i,line in enumerate(lines):
+        if heading in line:start=i;break
+    if start is None:return []
+    rows=[]
+    for line in lines[start+1:start+100]:
+        if line.startswith('### ') and rows:break
+        if '|' not in line:continue
+        cells=[re.sub(r'[*_`]','',c).strip() for c in line.strip().strip('|').split('|')]
+        if cells and not all(set(c)<=set('-: ') for c in cells if c):rows.append(cells)
+    width=max((len(r) for r in rows),default=0)
+    return [r+['']*(width-len(r)) for r in rows]
+
+def _reader_ticket(url,code,timeout=10):
+    diag={'route':'official-via-reader','source_url':url,'ticket':code}
+    try:
+        r=requests.get('https://r.jina.ai/'+url,timeout=timeout,headers={'User-Agent':'Mozilla/5.0','Accept':'text/plain,text/markdown,*/*','X-No-Cache':'true'})
+        diag.update({'http_status':r.status_code,'bytes':len(r.content)});r.raise_for_status()
+        heading={'3f':'3連複オッズ','2t':'2連単オッズ','2f':'2連複オッズ'}[code]
+        parser={'3f':_matrix_to_3f,'2t':_matrix_to_2t,'2f':_matrix_to_2f}[code]
+        found=parser(_markdown_matrix(r.text,heading));diag['parsed_count']=len(found)
+        return _df_from_found(found),diag
+    except Exception as e:
+        diag['error']=type(e).__name__;return empty_odds(),diag
+
+def fetch_ticket_odds(date_yyyymmdd,venue,race_no,code,timeout=8):
+    if code=='3t':return fetch_trifecta_odds(date_yyyymmdd,venue,race_no,timeout)
+    path='odds3f' if code=='3f' else 'odds2tf'
+    url=_official_ticket_url(date_yyyymmdd,venue,race_no,path)
+    diagnostics=[]
+    if not url:return empty_odds(),None,diagnostics
+    try:
+        s=requests.Session();s.headers.update(BROWSER_HEADERS)
+        try:s.get('https://www.boatrace.jp/',timeout=min(timeout,5))
+        except Exception:pass
+        r=s.get(url,timeout=timeout,headers={'Referer':'https://www.boatrace.jp/'})
+        diag={'route':'official-direct','url':url,'ticket':code,'http_status':r.status_code,'bytes':len(r.content)}
+        r.raise_for_status()
+        if not r.encoding or r.encoding.lower()=='iso-8859-1':r.encoding=r.apparent_encoding or 'utf-8'
+        found,pdiag=_parse_ticket_html(r.text,code);diag.update(pdiag);diagnostics.append(diag)
+        df=_df_from_found(found)
+        if len(df)>=max(5,int(TICKET_TARGETS[code]*0.75)):return df,url,diagnostics
+    except Exception as e:
+        diagnostics.append({'route':'official-direct','url':url,'ticket':code,'error':type(e).__name__})
+    df,diag=_reader_ticket(url,code,max(timeout,10));diagnostics.append(diag)
+    return df,url,diagnostics
+
+def fetch_all_ticket_odds(date_yyyymmdd,venue,race_no,timeout=8):
+    out={};diags={}
+    for code in ('3t','3f','2t','2f'):
+        df,url,diag=fetch_ticket_odds(date_yyyymmdd,venue,race_no,code,timeout)
+        out[code]=df;diags[code]=diag
+    return out,diags
