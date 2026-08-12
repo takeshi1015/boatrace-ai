@@ -12,14 +12,14 @@ from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticke
 from src.context_reliability import fit_context_reliability,current_race_context,context_factor,apply_context_factor,apply_market_overlay
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
-from src.persistence import save_pickle,load_pickle,remove_pickle
+from src.persistence import save_pickle,load_pickle,remove_pickle,export_learning_snapshot,import_learning_snapshot,cache_file_exists
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.2'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3a'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
 SNAPSHOT_VERSION='v2132-assets-1'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
-st.set_page_config(page_title='BOAT RACE AI v2.13.2',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.13.3a',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.2：保存型学習＋未見検証修正（通常起動は保存済み学習を再利用）')
+st.caption('v2.13.3a：①学習スナップショット保存・復元（契約不要の確実保存）')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2,c3=st.columns([3.2,1,1.35])
@@ -27,6 +27,38 @@ c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
 if c2.button('当日データ・オッズ更新',use_container_width=True):
     st.rerun()
 retrain_clicked=c3.button('最新結果で再学習',use_container_width=True,type='secondary')
+
+
+with st.expander('① 学習スナップショットの保存・復元', expanded=False):
+    st.caption('Streamlit Community Cloudのローカル保存は再起動後まで残る保証がないため、学習済み状態をZIPとしてPCに保存します。次回は同じZIPをアップロードして復元できます。')
+    snap_bytes = export_learning_snapshot()
+    a1, a2 = st.columns(2)
+    if snap_bytes:
+        a1.download_button(
+            '学習スナップショットをPCへ保存',
+            data=snap_bytes,
+            file_name=f'boatrace_learning_snapshot_{now:%Y%m%d_%H%M}.zip',
+            mime='application/zip',
+            use_container_width=True,
+        )
+        a1.success('保存可能な学習結果があります')
+    else:
+        a1.info('まだ保存可能な学習結果がありません')
+
+    uploaded_snapshot = a2.file_uploader(
+        '以前保存した学習スナップショットを選択',
+        type=['zip'],
+        key='learning_snapshot_upload',
+    )
+    if uploaded_snapshot is not None:
+        if a2.button('この学習結果を復元', use_container_width=True):
+            result = import_learning_snapshot(uploaded_snapshot.getvalue())
+            if result.get('restored'):
+                st.success('復元しました: ' + ', '.join(result['restored']))
+                st.cache_resource.clear()
+                st.rerun()
+            else:
+                st.error('復元できませんでした: ' + ' / '.join(result.get('errors', ['不明なエラー'])))
 
 @st.cache_data(ttl=21600,show_spinner='公開済み結果を確認しています…')
 def load_hist():
@@ -100,7 +132,7 @@ if retrain_clicked:
         save_pickle('learning_assets',assets,{'version':SNAPSHOT_VERSION,'mode':'full'})
         remove_pickle('bootstrap_assets')
         rs.write('④ 学習結果を保存')
-        rs.update(label='再学習完了。保存済みモデルへ切り替えます',state='complete')
+        rs.update(label='再学習完了。上部の「学習スナップショットをPCへ保存」で必ずバックアップしてください',state='complete')
     st.cache_resource.clear()
     st.rerun()
 

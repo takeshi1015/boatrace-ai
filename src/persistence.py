@@ -46,3 +46,72 @@ def remove_pickle(name: str):
         p.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def cache_file_exists(name: str) -> bool:
+    return _path(name).exists()
+
+
+def export_learning_snapshot(names=('models', 'learning_assets')) -> bytes | None:
+    """Export runtime learning cache as a portable ZIP kept by the user."""
+    import io, json, zipfile
+    files = []
+    for name in names:
+        fp = _path(name)
+        if fp.exists() and fp.is_file():
+            files.append((name, fp))
+    if not files:
+        return None
+
+    bio = io.BytesIO()
+    manifest = {
+        'format': 'boatrace-learning-snapshot-v1',
+        'created_at': time.time(),
+        'files': [name for name, _ in files],
+    }
+    with zipfile.ZipFile(bio, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False))
+        for name, fp in files:
+            z.writestr(f'cache/{name}.pkl', fp.read_bytes())
+    return bio.getvalue()
+
+
+def import_learning_snapshot(data: bytes, allowed_names=('models', 'learning_assets')) -> dict:
+    """Restore a user-owned learning snapshot into the runtime cache."""
+    import io, json, zipfile
+    result = {'restored': [], 'errors': []}
+    if not data:
+        result['errors'].append('空のファイルです')
+        return result
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), 'r') as z:
+            names = set(z.namelist())
+            if 'manifest.json' not in names:
+                result['errors'].append('学習スナップショットではありません')
+                return result
+            manifest = json.loads(z.read('manifest.json').decode('utf-8'))
+            if manifest.get('format') != 'boatrace-learning-snapshot-v1':
+                result['errors'].append('未対応のスナップショット形式です')
+                return result
+
+            for name in allowed_names:
+                member = f'cache/{name}.pkl'
+                if member not in names:
+                    continue
+                raw = z.read(member)
+                if len(raw) > 100 * 1024 * 1024:
+                    result['errors'].append(f'{name} が大きすぎます')
+                    continue
+                # Validate payload before writing it.
+                payload = pickle.loads(raw)
+                if not isinstance(payload, dict) or 'value' not in payload or 'meta' not in payload:
+                    result['errors'].append(f'{name} の内容が不正です')
+                    continue
+                target = _path(name)
+                tmp = target.with_suffix('.restore.tmp')
+                tmp.write_bytes(raw)
+                tmp.replace(target)
+                result['restored'].append(name)
+    except Exception as e:
+        result['errors'].append(f'復元失敗: {type(e).__name__}')
+    return result
