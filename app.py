@@ -13,26 +13,31 @@ from src.context_reliability import fit_context_reliability,current_race_context
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.0'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.1'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-st.set_page_config(page_title='BOAT RACE AI v2.13.0',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.13.1',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.0：時系列適応・利益学習強化（30/90/180日＋長期を自動比較）')
+st.caption('v2.13.1：高速化＋未見検証復旧（通常更新は軽量、再学習は必要時のみ）')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2=st.columns([4,1])
 c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
-if c2.button('最新データに更新',use_container_width=True):
-    st.cache_data.clear();st.cache_resource.clear();st.rerun()
+if c2.button('当日データ・オッズ更新',use_container_width=True):
+    # Today's race feed and odds are fetched on every rerun. Keep the heavy
+    # historical/model/OOS caches so an intraday refresh does not retrain AI.
+    st.rerun()
 
-@st.cache_data(ttl=21600,show_spinner='長期学習データを再構築しています…')
+@st.cache_data(ttl=86400,show_spinner='長期学習データを再構築しています…')
 def load_hist():return historical_dataset(220)
-@st.cache_resource(ttl=21600,show_spinner='最新結果を含めAIを再学習しています…')
+@st.cache_resource(ttl=86400,show_spinner='最新結果を含めAIを再学習しています…')
 def load_models():return fit_models(load_hist())
-@st.cache_data(ttl=21600,show_spinner='未見データ検証と確率校正を更新しています…')
+@st.cache_data(ttl=86400,show_spinner='未見データ検証と確率校正を更新しています…')
 def learning_assets():
-    preds=generate_walk_forward_predictions(load_hist(),min_train_days=40,test_days=14,max_test_days=175)
-    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=180,step_days=7,min_bets=90,min_selector_days=35)
+    # Use broad OOS coverage but retrain the walk-forward model only every
+    # 28-day block. This preserves strict future-only validation while reducing
+    # model fits substantially versus the v2.13.0 14-day schedule.
+    preds=generate_walk_forward_predictions(load_hist(),min_train_days=35,test_days=28,max_test_days=196)
+    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=180,step_days=14,min_bets=90,min_selector_days=35)
     gate=deployment_gate(metrics,folds,min_oos_bets=200,min_oos_roi=1.00,min_positive_fold_ratio=0.60,min_recent_fold_ratio=0.50)
     rule,rstats=fit_current_selector(preds,lookback_days=180,min_bets=100)
     calibrator,cstats=fit_probability_calibrator(preds)
@@ -51,6 +56,8 @@ if models is None:st.error('AIモデルを作成できませんでした。');st
 preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate,context_stats=learning_assets()
 base_stats=summarize(preds)
 temporal_stats=temporal_profit_summary(selector_bt)
+if gate.get('oos_bets',0)==0 and base_stats.get('races',0)>0:
+    st.warning('未見予測は作成できていますが、利益選別の未見評価が0件です。実戦ゲートは自動的に未合格とし、再学習時に復旧を試みます。')
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 
 st.header('本日の状態')
@@ -307,4 +314,4 @@ with st.expander('学習・校正・未見検証の詳細'):
 st.subheader('AI再学習')
 if st.button('最新結果で再学習する'):
     st.cache_data.clear();st.cache_resource.clear();st.success('キャッシュを消去しました。再読込すると公開済み最新結果まで含めて再学習します。')
-st.caption('v2.13.0は30/90/180日・長期の未見成績を同時評価し、直近を重くしつつ複数期間で安定した利益条件だけを現在ルールへ採用します。')
+st.caption('v2.13.1は通常更新では重い再学習を行わず、未見検証の期間条件を修正してOOS評価を復旧します。長期再学習は「最新結果で再学習する」時だけ実行します。')

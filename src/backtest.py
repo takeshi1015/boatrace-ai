@@ -209,15 +209,21 @@ def optimize_rule_temporal(train, windows=(30,90,180,None), min_bets=100):
     # cheaper and less overfit than searching the full grid four times jointly.
     candidates=[]
     horizon_defs=[]
+    # Full-grid search is expensive. Search only a compact set of horizons:
+    # recent 30d, medium 90d, and all available history. 180d is still used
+    # for evaluation below when enough history exists, but does not trigger an
+    # additional full grid search.
+    search_windows=(30,90,None)
     for w in windows:
         x=_date_window(t,w)
         if x.empty:continue
-        # Short windows need a smaller minimum to remain usable.
+        horizon_defs.append((w,x))
+        if w not in search_windows:
+            continue
         mb=max(35,min(min_bets,int(max(35,len(x)*0.06))))
         rule,stats=optimize_rule(x,min_bets=mb)
         if rule is not None:
             candidates.append(rule)
-        horizon_defs.append((w,x))
     if not candidates:
         return optimize_rule(t,min_bets=min_bets)
 
@@ -275,7 +281,7 @@ def nested_selector_backtest(preds, lookback_days=180, step_days=7, min_bets=100
     p["date_dt"] = pd.to_datetime(p["race_date"], errors="coerce")
     p = p[p["date_dt"].notna()].sort_values("date_dt")
     dates = sorted(p["date_dt"].dt.normalize().drop_duplicates())
-    if len(dates) < lookback_days + step_days:
+    if len(dates) < min_selector_days + step_days:
         return pd.DataFrame(), {}, pd.DataFrame()
 
     eval_rows = []
