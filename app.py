@@ -12,58 +12,120 @@ from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticke
 from src.context_reliability import fit_context_reliability,current_race_context,context_factor,apply_context_factor,apply_market_overlay
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
+from src.persistence import save_pickle,load_pickle,remove_pickle
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.1'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.2'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-st.set_page_config(page_title='BOAT RACE AI v2.13.1',layout='wide')
+SNAPSHOT_VERSION='v2132-assets-1'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
+st.set_page_config(page_title='BOAT RACE AI v2.13.2',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.1：高速化＋未見検証復旧（通常更新は軽量、再学習は必要時のみ）')
+st.caption('v2.13.2：保存型学習＋未見検証修正（通常起動は保存済み学習を再利用）')
 now=pd.Timestamp.now(tz=JST)
 
-c1,c2=st.columns([4,1])
+c1,c2,c3=st.columns([3.2,1,1.35])
 c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
 if c2.button('当日データ・オッズ更新',use_container_width=True):
-    # Today's race feed and odds are fetched on every rerun. Keep the heavy
-    # historical/model/OOS caches so an intraday refresh does not retrain AI.
     st.rerun()
+retrain_clicked=c3.button('最新結果で再学習',use_container_width=True,type='secondary')
 
-@st.cache_data(ttl=86400,show_spinner='長期学習データを再構築しています…')
-def load_hist():return historical_dataset(220)
-@st.cache_resource(ttl=86400,show_spinner='最新結果を含めAIを再学習しています…')
-def load_models():return fit_models(load_hist())
-@st.cache_data(ttl=86400,show_spinner='未見データ検証と確率校正を更新しています…')
-def learning_assets():
-    # Use broad OOS coverage but retrain the walk-forward model only every
-    # 28-day block. This preserves strict future-only validation while reducing
-    # model fits substantially versus the v2.13.0 14-day schedule.
-    preds=generate_walk_forward_predictions(load_hist(),min_train_days=35,test_days=28,max_test_days=196)
-    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=180,step_days=14,min_bets=90,min_selector_days=35)
+@st.cache_data(ttl=21600,show_spinner='公開済み結果を確認しています…')
+def load_hist():
+    return historical_dataset(220)
+
+def _recent_hist(h,days=120):
+    if h is None or h.empty:return h
+    x=h.copy(); d=pd.to_datetime(x.get('race_date'),errors='coerce')
+    if not d.notna().any():return x
+    cutoff=d.max()-pd.Timedelta(days=int(days)-1)
+    return x[d>=cutoff].copy()
+
+@st.cache_resource(ttl=21600,show_spinner='保存済み予測モデルを読み込んでいます…')
+def load_models_cached():
+    snap=load_pickle('models',max_age_hours=168,required_version=MODEL_SNAPSHOT_VERSION)
+    if snap is not None:
+        return snap['value'], '保存済み学習モデル'
+    # Do not train tens of thousands of races during normal startup. Until the
+    # explicit retraining is run once, trifecta_table uses its conservative
+    # fallback scores and the deployment gate remains locked.
+    return None,'未学習（簡易予測・購入不可）'
+
+def _empty_learning_assets():
+    gate={'passed':False,'reasons':['厳密な未見検証は未実施（再学習ボタンで実行）'],
+          'oos_bets':0,'oos_roi':0.0,'oos_hit_rate':0.0,
+          'positive_fold_ratio':0.0,'recent_positive_ratio':0.0,'valid_folds':0}
+    ticket_stats={c:{'samples':0,'positives':0,'safe_factor':0.70,'mean_pred':None,'hit_rate':None} for c in ('3t','3f','2t','2f')}
+    ticket_models={c:None for c in ('3t','3f','2t','2f')}
+    # Ticket reliability is intentionally false. The UI may still show reference
+    # odds/EV, but final BUY is impossible until strict OOS retraining is saved.
+    ticket_gate={c:{'passed':False,'reasons':['未見校正未実施'],'samples':0,'safe_factor':0.70} for c in ('3t','3f','2t','2f')}
+    return (pd.DataFrame(),pd.DataFrame(),{},pd.DataFrame(),gate,None,{},None,
+            {'samples':0,'positives':0,'brier_raw':None,'brier_cal':None},
+            ticket_models,ticket_stats,ticket_gate,{})
+
+def _build_learning_assets(full=True):
+    h=load_hist()
+    # 112 future-side days provide far more than 200 candidate races while
+    # requiring only four 28-day model fits. This is strict walk-forward: every
+    # evaluated race is predicted by a model trained only on earlier dates.
+    preds=generate_walk_forward_predictions(h,min_train_days=35,test_days=28,max_test_days=112)
+    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=35,step_days=7,min_bets=80,min_selector_days=35)
     gate=deployment_gate(metrics,folds,min_oos_bets=200,min_oos_roi=1.00,min_positive_fold_ratio=0.60,min_recent_fold_ratio=0.50)
     rule,rstats=fit_current_selector(preds,lookback_days=180,min_bets=100)
     calibrator,cstats=fit_probability_calibrator(preds)
     ticket_calibrators,ticket_stats=fit_ticket_calibrators(preds)
     ticket_gate=ticket_reliability_gate(ticket_stats,min_samples=200)
     context_stats=fit_context_reliability(preds,min_samples=25)
-    return preds,selected,metrics,folds,gate,rule,rstats,calibrator,cstats,ticket_calibrators,ticket_stats,ticket_gate,context_stats
+    return (preds,selected,metrics,folds,gate,rule,rstats,calibrator,cstats,
+            ticket_calibrators,ticket_stats,ticket_gate,context_stats)
+
+@st.cache_resource(ttl=21600,show_spinner='保存済み学習結果を読み込んでいます…')
+def load_learning_assets_cached():
+    snap=load_pickle('learning_assets',max_age_hours=168,required_version=SNAPSHOT_VERSION)
+    if snap is not None:
+        return snap['value'], 'full', '保存済み厳密検証'
+    return _empty_learning_assets(),'none','未実施（即時起動）'
+
+if retrain_clicked:
+    with st.status('長期再学習を実行しています。通常更新ではこの処理は走りません…',expanded=True) as rs:
+        rs.write('① 220日分の公開結果を確認')
+        st.cache_data.clear()
+        h=load_hist()
+        rs.write('② 予測モデルを再学習')
+        m=fit_models(_recent_hist(h,180))
+        if m is None:
+            rs.update(label='再学習に失敗しました',state='error');st.stop()
+        save_pickle('models',m,{'version':MODEL_SNAPSHOT_VERSION,'scope':'full220'})
+        rs.write('③ 厳密なWalk-forward未見検証・確率校正を実行')
+        assets=_build_learning_assets(full=True)
+        save_pickle('learning_assets',assets,{'version':SNAPSHOT_VERSION,'mode':'full'})
+        remove_pickle('bootstrap_assets')
+        rs.write('④ 学習結果を保存')
+        rs.update(label='再学習完了。保存済みモデルへ切り替えます',state='complete')
+    st.cache_resource.clear()
+    st.rerun()
 
 try: today=flatten(fetch_today(),False)
 except Exception:
     st.error('本日のレースデータを取得できません。');st.stop()
 if today.empty:st.warning('本日のレースデータがありません。');st.stop()
 
-hist=load_hist();models=load_models()
-if models is None:st.error('AIモデルを作成できませんでした。');st.stop()
-preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate,context_stats=learning_assets()
+hist=load_hist();models,model_source=load_models_cached()
+_assets,learning_mode,learning_source=load_learning_assets_cached()
+preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate,context_stats=_assets
 base_stats=summarize(preds)
 temporal_stats=temporal_profit_summary(selector_bt)
-if gate.get('oos_bets',0)==0 and base_stats.get('races',0)>0:
-    st.warning('未見予測は作成できていますが、利益選別の未見評価が0件です。実戦ゲートは自動的に未合格とし、再学習時に復旧を試みます。')
+if gate.get('oos_bets',0)==0:
+    st.warning('未見利益検証は未実施です。「最新結果で再学習」を1回実行すると、厳密な未見検証を保存します。0.0%を実績値としては扱いません。')
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
+st.caption(f'起動モード：予測モデル={model_source} / 学習検証={learning_source}。保存済み学習が無い場合も即時起動し、実戦ゲートは必ずロックされます。')
+
+if learning_mode=='none':
+    st.info('高速起動モード：保存済み学習がまだありません。参考予想は表示できますが、実戦の「買い」は出ません。時間のある時に上部の「最新結果で再学習」を1回実行してください。')
 
 st.header('本日の状態')
 a,b,c,d=st.columns(4)
-a.metric('未見検証',f"{gate['oos_bets']:,}/200")
-b.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%")
+a.metric('未見検証',f"{gate['oos_bets']:,}/200" if gate.get('oos_bets',0)>0 else '未実施')
+b.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%" if gate.get('oos_bets',0)>0 else '未実施')
 c.metric('最新結果日',latest_date)
 d.metric('実戦ゲート','合格' if gate['passed'] else '未合格')
 if gate['passed']:
@@ -80,8 +142,8 @@ with st.expander('学習状況・券種別信頼度・条件別弱点（詳細�
     a.metric('学習レース',f"{hist['race_id'].nunique():,}")
     b.metric('最新結果日',latest_date)
     c.metric('校正サンプル',f"{cal_stats.get('samples',0):,}")
-    d.metric('未見検証',f"{gate['oos_bets']:,}/200")
-    e.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%")
+    d.metric('未見検証',f"{gate['oos_bets']:,}/200" if gate.get('oos_bets',0)>0 else '未実施')
+    e.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%" if gate.get('oos_bets',0)>0 else '未実施')
     if cal_stats.get('brier_raw') is not None:
         delta=cal_stats['brier_raw']-cal_stats['brier_cal']
         st.caption(f"確率校正 Brier: 校正前 {cal_stats['brier_raw']:.4f} → 校正後 {cal_stats['brier_cal']:.4f}（改善 {delta:+.4f}）")
@@ -169,7 +231,7 @@ for _,r in pool.iterrows():
         merged[code]=apply_market_overlay(merge_odds(pdf,odds.get(code,pd.DataFrame(columns=['combo','odds']))))
     details[rid]=merged
     reliable={code:df for code,df in merged.items() if ticket_gate.get(code,{}).get('passed')}
-    candidate_source=reliable if reliable else {}
+    candidate_source=reliable if reliable else (merged if learning_mode=='none' else {})
     safe,value=choose_ticket_candidates(candidate_source);priority,priority_reason=priority_candidate(safe,value)
     if priority is None:
         # No ticket type has enough OOS probability reliability yet. Keep the race in details only.
@@ -312,6 +374,4 @@ with st.expander('学習・校正・未見検証の詳細'):
     if folds is not None and not folds.empty:st.dataframe(folds,use_container_width=True,hide_index=True)
 
 st.subheader('AI再学習')
-if st.button('最新結果で再学習する'):
-    st.cache_data.clear();st.cache_resource.clear();st.success('キャッシュを消去しました。再読込すると公開済み最新結果まで含めて再学習します。')
-st.caption('v2.13.1は通常更新では重い再学習を行わず、未見検証の期間条件を修正してOOS評価を復旧します。長期再学習は「最新結果で再学習する」時だけ実行します。')
+st.caption('再学習は画面上部の「最新結果で再学習」から実行します。通常の「当日データ・オッズ更新」では保存済みモデルを再利用するため、長期学習は走りません。')

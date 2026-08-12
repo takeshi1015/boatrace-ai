@@ -273,7 +273,15 @@ def temporal_profit_summary(df):
         rows.append({"期間":"全期間" if w is None else f"直近{w}日","件数":s["races"],"的中率":s["hit_rate"],"回収率":s["roi"],"損益":s["profit"]})
     return pd.DataFrame(rows)
 
-def nested_selector_backtest(preds, lookback_days=180, step_days=7, min_bets=100, min_selector_days=35):
+def nested_selector_backtest(preds, lookback_days=35, step_days=7, min_bets=90, min_selector_days=35):
+    """Strict walk-forward selector validation.
+
+    The selector for each test fold is fitted only on dates before that fold.
+    v2.13.2 intentionally uses the robust single-horizon optimizer here; the
+    richer temporal optimizer remains available for the *current* rule. This
+    avoids the v2.13.0/1 failure mode where an overly strict multi-horizon rule
+    selected zero bets in every future fold.
+    """
     if preds is None or preds.empty:
         return pd.DataFrame(), {}, pd.DataFrame()
 
@@ -286,7 +294,6 @@ def nested_selector_backtest(preds, lookback_days=180, step_days=7, min_bets=100
 
     eval_rows = []
     fold_rows = []
-
     for i in range(min_selector_days, len(dates), step_days):
         test_dates = dates[i:i+step_days]
         if not test_dates:
@@ -294,30 +301,29 @@ def nested_selector_backtest(preds, lookback_days=180, step_days=7, min_bets=100
         train_dates = dates[max(0, i-lookback_days):i]
         train = p[p["date_dt"].dt.normalize().isin(train_dates)]
         test = p[p["date_dt"].dt.normalize().isin(test_dates)]
-
-        rule, train_stats = optimize_rule_temporal(train, min_bets=min_bets)
-        if rule is None:
+        if train.empty or test.empty:
             continue
 
+        # Scale the minimum count to the actual training window so a compact
+        # 35-day fold cannot become impossible merely because global history grew.
+        fold_min = max(35, min(int(min_bets), int(max(35, len(train)*0.08))))
+        rule, train_stats = optimize_rule(train, min_bets=fold_min)
+        if rule is None:
+            continue
         chosen = _apply_rule(test, rule)
         test_stats = summarize(chosen)
-
         fold_rows.append({
             "test_start": str(pd.Timestamp(test_dates[0]).date()),
             "test_end": str(pd.Timestamp(test_dates[-1]).date()),
             **rule,
             "train_bets": train_stats.get("races",0),
             "train_roi": train_stats.get("roi",0),
-            "train_shrunk_roi": train_stats.get("shrunk_roi",train_stats.get("roi",0)),
-            "temporal_score": train_stats.get("temporal_score",0),
-            "profitable_windows": train_stats.get("profitable_windows",0),
-            "available_windows": train_stats.get("available_windows",0),
+            "train_shrunk_roi": train_stats.get("shrunk_roi",0),
             "test_bets": test_stats.get("races",0),
             "test_hit_rate": test_stats.get("hit_rate",0),
             "test_roi": test_stats.get("roi",0),
             "test_profit": test_stats.get("profit",0),
         })
-
         if len(chosen):
             chosen = chosen.copy()
             chosen["fold_test_start"] = str(pd.Timestamp(test_dates[0]).date())
