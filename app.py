@@ -13,11 +13,11 @@ from src.context_reliability import fit_context_reliability,current_race_context
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11.3'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11.4'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-st.set_page_config(page_title='BOAT RACE AI v2.11.3',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.11.4',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.11.3：1ページ購入判断一覧＋条件別得意不得意学習＋市場リスク補正')
+st.caption('v2.11.4：購入判断1画面完成版＋条件別得意不得意学習＋市場リスク補正')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2=st.columns([4,1])
@@ -162,55 +162,89 @@ for _,r in pool.iterrows():
 races=pd.DataFrame(race_rows)
 
 
-st.divider();st.header('本日の購入判断一覧')
+st.divider();st.header('本日の購入判断')
 if races.empty:
     st.warning('実オッズまで揃った候補がありません。');st.stop()
 
 summary=races.sort_values(['判断','残り分','優先期待値'],ascending=[True,True,False]).copy()
-summary['場R']=summary['場'].astype(str)+' '+summary['R'].astype(int).astype(str)+'R'
+summary['場・R']=summary['場'].astype(str)+' '+summary['R'].astype(int).astype(str)+'R'
 summary['優先案']=summary['優先券種'].astype(str)+' '+summary['優先買い目'].astype(str)
 summary['高確率案']=summary['高確率券種'].astype(str)+' '+summary['高確率買い目'].astype(str)
 summary['高期待値案']=summary['高期待値券種'].astype(str)+' '+summary['高期待値買い目'].astype(str)
 summary['AI確率']=summary['優先確率%'].map(lambda x:f'{x:.2f}%' if pd.notna(x) else '—')
 summary['実オッズ']=summary['優先オッズ'].map(lambda x:f'{x:.1f}倍' if pd.notna(x) else '—')
-summary['期待値']=summary['優先期待値'].map(lambda x:f'{x:.2f}' if pd.notna(x) else '—')
+summary['EV']=summary['優先期待値'].map(lambda x:f'{x:.2f}' if pd.notna(x) else '—')
 summary['残り']=summary['残り分'].map(lambda x:f'{x:.0f}分')
-summary['締切表示']=summary['締切'].astype(str)
+summary['最終推奨']=summary['判断'].map(lambda x:'購入' if x=='買い' else '見送り')
 
-buy_count=int((summary['判断']=='買い').sum())
-watch_count=int((summary['判断']=='見送り').sum())
+buy_rows=summary[summary['判断']=='買い'].sort_values(['残り分','優先期待値'],ascending=[True,False])
+watch_rows=summary[summary['判断']=='見送り'].sort_values(['残り分','優先期待値'],ascending=[True,False])
+
+# 最上段：買い候補だけを大きく表示
+if buy_rows.empty:
+    st.warning('## 現在、買い候補なし')
+    st.caption('実戦ゲートまたは安全補正条件を満たすレースがありません。画面が「見送り」の間は購入しない運用です。')
+else:
+    st.success(f'## 買い候補 {len(buy_rows)}レース')
+    for _,r in buy_rows.head(4).iterrows():
+        with st.container(border=True):
+            a,b,c,d,e,f=st.columns([1.0,1.25,1.0,1.25,1.25,1.0])
+            a.success('### 買い')
+            b.markdown(f"### {r['場・R']}")
+            c.metric('締切まで',r['残り'])
+            d.metric('券種',r['優先券種'])
+            e.metric('買い目',r['優先買い目'])
+            f.metric('EV',r['EV'])
+            x1,x2,x3,x4=st.columns(4)
+            x1.metric('AI確率',r['AI確率'])
+            x2.metric('実オッズ',r['実オッズ'])
+            x3.metric('高確率案',r['高確率案'])
+            x4.metric('高期待値案',r['高期待値案'])
+            st.caption('優先理由：'+str(r['優先理由']))
+
+# 1ページ用の全レース一覧
+st.subheader('購入判断一覧')
 m1,m2,m3,m4=st.columns(4)
-m1.metric('買い',f'{buy_count}レース')
-m2.metric('見送り',f'{watch_count}レース')
+m1.metric('買い',f'{len(buy_rows)}レース')
+m2.metric('見送り',f'{len(watch_rows)}レース')
 m3.metric('評価対象',f'{len(summary)}レース')
-m4.metric('ゲート','合格' if gate['passed'] else '未合格')
+m4.metric('実戦ゲート','合格' if gate['passed'] else '未合格')
 
-cols=['判断','場R','締切表示','残り','優先案','AI確率','実オッズ','期待値','高確率案','高期待値案','オッズ更新']
-view=summary[cols].rename(columns={'締切表示':'締切'})
-st.dataframe(view,use_container_width=True,hide_index=True,height=min(70+35*len(view),520))
+compact_cols=['最終推奨','場・R','締切','残り','優先券種','優先買い目','AI確率','実オッズ','EV','高確率案','高期待値案']
+compact=summary[compact_cols].copy()
+st.dataframe(
+    compact,
+    use_container_width=True,
+    hide_index=True,
+    height=min(75+34*len(compact),500),
+    column_config={
+        '最終推奨':st.column_config.TextColumn('判断',width='small'),
+        '場・R':st.column_config.TextColumn('場・R',width='small'),
+        '締切':st.column_config.TextColumn('締切',width='small'),
+        '残り':st.column_config.TextColumn('残り',width='small'),
+        '優先券種':st.column_config.TextColumn('券種',width='small'),
+        '優先買い目':st.column_config.TextColumn('買い目',width='small'),
+        'AI確率':st.column_config.TextColumn('AI確率',width='small'),
+        '実オッズ':st.column_config.TextColumn('実オッズ',width='small'),
+        'EV':st.column_config.TextColumn('EV',width='small'),
+        '高確率案':st.column_config.TextColumn('高確率案',width='medium'),
+        '高期待値案':st.column_config.TextColumn('高期待値案',width='medium'),
+    }
+)
 
 if not gate['passed']:
-    st.info('現在は実戦ゲート未合格のため、一覧に高期待値候補があっても最終判断は「見送り」です。')
+    st.info('実戦ゲート未合格のため、現在の最終推奨はすべて「見送り」です。候補のEVが高くても購入対象にはしません。')
 
-with st.expander('候補カードを詳しく見る',expanded=False):
-    headline=races[races['参考候補']].sort_values(['残り分','優先期待値'],ascending=[True,False])
-    if headline.empty:
-        st.warning('現在、安全補正期待値1.10以上・過去選別条件・券種信頼度をすべて満たす候補はありません。')
-    else:
-        for _,r in headline.head(5).iterrows():
-            with st.container(border=True):
-                a,b,c,d,e=st.columns([1.0,1.3,1.1,1.2,1.4])
-                (a.success if r['判断']=='買い' else a.warning)(f"## {r['判断']}")
-                b.markdown(f"### {r['場']} {int(r['R'])}R")
-                c.metric('締切まで',f"{r['残り分']:.0f}分")
-                d.metric('優先券種',r['優先券種'])
-                e.markdown(f"### {r['優先買い目']}")
-                x1,x2,x3,x4=st.columns(4)
-                x1.metric('高確率案',f"{r['高確率券種']} {r['高確率買い目']}")
-                x2.metric('高確率AI',f"{r['高確率確率%']:.2f}%")
-                x3.metric('高期待値案',f"{r['高期待値券種']} {r['高期待値買い目']}")
-                x4.metric('高期待値EV',f"{r['高期待値期待値']:.2f}" if pd.notna(r['高期待値期待値']) else '—')
-                st.info(f"優先：{r['優先券種']} {r['優先買い目']} ／ 実オッズ {r['優先オッズ']:.1f}倍 ／ EV {r['優先期待値']:.2f} ／ {r['優先理由']}")
+with st.expander('見送り理由・候補カードを確認',expanded=False):
+    st.caption('必要な場合だけ開いてください。通常の購入判断は上の一覧だけで完結します。')
+    for _,r in summary.head(12).iterrows():
+        with st.container(border=True):
+            a,b,c,d=st.columns([1.0,1.2,1.0,2.2])
+            (a.success if r['判断']=='買い' else a.warning)(f"### {r['判断']}")
+            b.markdown(f"### {r['場・R']}")
+            c.metric('残り',r['残り'])
+            d.write('**理由：** '+('購入条件を満たす' if r['判断']=='買い' else ('ゲート未合格' if not gate['passed'] else '安全補正条件未達')))
+            st.caption(f"優先 {r['優先案']} / AI {r['AI確率']} / オッズ {r['実オッズ']} / EV {r['EV']} / {r['優先理由']}")
 
 with st.expander('条件別の得意不得意学習',expanded=False):
     ctx_cols=st.columns(4)
@@ -255,4 +289,4 @@ with st.expander('学習・校正・未見検証の詳細'):
 st.subheader('AI再学習')
 if st.button('最新結果で再学習する'):
     st.cache_data.clear();st.cache_resource.clear();st.success('キャッシュを消去しました。再読込すると公開済み最新結果まで含めて再学習します。')
-st.caption('v2.11.3は購入判断を1ページ一覧へ集約し、詳細学習情報は折りたたみ表示にしました。予測ロジックはv2.11.2を維持しています。')
+st.caption('v2.11.4は「買い候補→全レース1行一覧→詳細」の順に整理した購入判断1画面完成版です。予測ロジックはv2.11.2を維持しています。')
