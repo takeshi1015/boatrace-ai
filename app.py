@@ -13,11 +13,11 @@ from src.context_reliability import fit_context_reliability,current_race_context
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11.2'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11.3'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-st.set_page_config(page_title='BOAT RACE AI v2.11.2',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.11.3',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.11.2：場別・1号艇条件・レース帯・風波条件の得意不得意学習＋市場リスク補正')
+st.caption('v2.11.3：1ページ購入判断一覧＋条件別得意不得意学習＋市場リスク補正')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2=st.columns([4,1])
@@ -52,33 +52,40 @@ preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibra
 base_stats=summarize(preds)
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 
-st.header('自己学習状況')
-a,b,c,d,e=st.columns(5)
-a.metric('学習レース',f"{hist['race_id'].nunique():,}")
-b.metric('最新結果日',latest_date)
-c.metric('校正サンプル',f"{cal_stats.get('samples',0):,}")
-d.metric('未見検証',f"{gate['oos_bets']:,}/200")
-e.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%")
-if cal_stats.get('brier_raw') is not None:
-    delta=cal_stats['brier_raw']-cal_stats['brier_cal']
-    st.caption(f"確率校正 Brier: 校正前 {cal_stats['brier_raw']:.4f} → 校正後 {cal_stats['brier_cal']:.4f}（改善 {delta:+.4f}）。毎回、公開済み結果を再取得して過去を再演算します。")
-else:st.caption('確率校正はサンプル蓄積中です。')
-if gate['passed']:st.success('実戦投入ゲート：合格')
-else:st.warning('実戦投入ゲート：未合格。試験候補は表示しますが、購入判断は慎重にしてください。 理由：'+' / '.join(gate['reasons']))
+st.header('本日の状態')
+a,b,c,d=st.columns(4)
+a.metric('未見検証',f"{gate['oos_bets']:,}/200")
+b.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%")
+c.metric('最新結果日',latest_date)
+d.metric('実戦ゲート','合格' if gate['passed'] else '未合格')
+if gate['passed']:
+    st.success('実戦投入ゲート：合格')
+else:
+    st.warning('実戦投入ゲート：未合格。現在は「見送り」を優先してください。 理由：'+' / '.join(gate['reasons']))
 
-st.subheader('券種別の未見確率信頼度')
-rg=st.columns(4)
-for i,code in enumerate(('3t','3f','2t','2f')):
-    g=ticket_gate.get(code,{})
-    stat=ticket_stats.get(code,{})
-    name=TICKET_NAMES[code]
-    hr=stat.get('hit_rate'); mp=stat.get('mean_pred')
-    label='信頼可' if g.get('passed') else '試験中'
-    rg[i].metric(name,label,delta=f"未見 {g.get('samples',0)}件")
-    if hr is not None and mp is not None:
-        rg[i].caption(f"予測平均 {mp*100:.1f}% / 実的中 {hr*100:.1f}% / 安全係数 {stat.get('safe_factor',1.0):.2f}")
-    if g.get('reasons'): rg[i].caption('・'.join(g['reasons']))
-
+with st.expander('学習状況・券種別信頼度・条件別弱点（詳細）',expanded=False):
+    st.subheader('自己学習状況')
+    a,b,c,d,e=st.columns(5)
+    a.metric('学習レース',f"{hist['race_id'].nunique():,}")
+    b.metric('最新結果日',latest_date)
+    c.metric('校正サンプル',f"{cal_stats.get('samples',0):,}")
+    d.metric('未見検証',f"{gate['oos_bets']:,}/200")
+    e.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%")
+    if cal_stats.get('brier_raw') is not None:
+        delta=cal_stats['brier_raw']-cal_stats['brier_cal']
+        st.caption(f"確率校正 Brier: 校正前 {cal_stats['brier_raw']:.4f} → 校正後 {cal_stats['brier_cal']:.4f}（改善 {delta:+.4f}）")
+    st.subheader('券種別の未見確率信頼度')
+    rg=st.columns(4)
+    for i,code in enumerate(('3t','3f','2t','2f')):
+        g=ticket_gate.get(code,{})
+        stat=ticket_stats.get(code,{})
+        name=TICKET_NAMES[code]
+        hr=stat.get('hit_rate'); mp=stat.get('mean_pred')
+        label='信頼可' if g.get('passed') else '試験中'
+        rg[i].metric(name,label,delta=f"未見 {g.get('samples',0)}件")
+        if hr is not None and mp is not None:
+            rg[i].caption(f"予測平均 {mp*100:.1f}% / 実的中 {hr*100:.1f}% / 安全係数 {stat.get('safe_factor',1.0):.2f}")
+        if g.get('reasons'): rg[i].caption('・'.join(g['reasons']))
 # Times
 dt=pd.to_datetime(today['closed_at'],errors='coerce')
 if dt.dt.tz is None:dt=dt.dt.tz_localize(JST,nonexistent='shift_forward',ambiguous='NaT')
@@ -155,45 +162,70 @@ for _,r in pool.iterrows():
 races=pd.DataFrame(race_rows)
 
 
-st.subheader('条件別の得意不得意学習')
-ctx_cols=st.columns(4)
-ctx_dims=[('venue_ctx','競艇場別'),('lane1_ctx','1号艇条件'),('race_ctx','レース帯'),('wind_ctx','風条件')]
-for ci,(dim,label) in enumerate(ctx_dims):
-    # show worst learned 3t factor as a quick health indicator
-    vals=[]
-    for key,stat in ((context_stats.get('3t',{}) or {}).get(dim,{}) or {}).items():
-        if int(stat.get('samples',0))>=25:
-            vals.append((float(stat.get('factor',1.0)),key,int(stat.get('samples',0))))
-    if vals:
-        f,key,n=sorted(vals)[0]
-        ctx_cols[ci].metric(label,f'弱点: {key}',delta=f'補正×{f:.2f} / {n}件')
+st.divider();st.header('本日の購入判断一覧')
+if races.empty:
+    st.warning('実オッズまで揃った候補がありません。');st.stop()
+
+summary=races.sort_values(['判断','残り分','優先期待値'],ascending=[True,True,False]).copy()
+summary['場R']=summary['場'].astype(str)+' '+summary['R'].astype(int).astype(str)+'R'
+summary['優先案']=summary['優先券種'].astype(str)+' '+summary['優先買い目'].astype(str)
+summary['高確率案']=summary['高確率券種'].astype(str)+' '+summary['高確率買い目'].astype(str)
+summary['高期待値案']=summary['高期待値券種'].astype(str)+' '+summary['高期待値買い目'].astype(str)
+summary['AI確率']=summary['優先確率%'].map(lambda x:f'{x:.2f}%' if pd.notna(x) else '—')
+summary['実オッズ']=summary['優先オッズ'].map(lambda x:f'{x:.1f}倍' if pd.notna(x) else '—')
+summary['期待値']=summary['優先期待値'].map(lambda x:f'{x:.2f}' if pd.notna(x) else '—')
+summary['残り']=summary['残り分'].map(lambda x:f'{x:.0f}分')
+summary['締切表示']=summary['締切'].astype(str)
+
+buy_count=int((summary['判断']=='買い').sum())
+watch_count=int((summary['判断']=='見送り').sum())
+m1,m2,m3,m4=st.columns(4)
+m1.metric('買い',f'{buy_count}レース')
+m2.metric('見送り',f'{watch_count}レース')
+m3.metric('評価対象',f'{len(summary)}レース')
+m4.metric('ゲート','合格' if gate['passed'] else '未合格')
+
+cols=['判断','場R','締切表示','残り','優先案','AI確率','実オッズ','期待値','高確率案','高期待値案','オッズ更新']
+view=summary[cols].rename(columns={'締切表示':'締切'})
+st.dataframe(view,use_container_width=True,hide_index=True,height=min(70+35*len(view),520))
+
+if not gate['passed']:
+    st.info('現在は実戦ゲート未合格のため、一覧に高期待値候補があっても最終判断は「見送り」です。')
+
+with st.expander('候補カードを詳しく見る',expanded=False):
+    headline=races[races['参考候補']].sort_values(['残り分','優先期待値'],ascending=[True,False])
+    if headline.empty:
+        st.warning('現在、安全補正期待値1.10以上・過去選別条件・券種信頼度をすべて満たす候補はありません。')
     else:
-        ctx_cols[ci].metric(label,'学習中')
-st.caption('不得意条件は未見予測での実的中率/予測確率をベイズ縮約し、確率を下げる方向にだけ補正します。オッズ帯・人気帯は公開済み過去の締切時オッズ履歴をまだ十分保存していないため、現在は当日市場の極端な高オッズ・低人気を保守的に下げるリスク補正として適用し、履歴蓄積後に学習型へ切り替えます。')
+        for _,r in headline.head(5).iterrows():
+            with st.container(border=True):
+                a,b,c,d,e=st.columns([1.0,1.3,1.1,1.2,1.4])
+                (a.success if r['判断']=='買い' else a.warning)(f"## {r['判断']}")
+                b.markdown(f"### {r['場']} {int(r['R'])}R")
+                c.metric('締切まで',f"{r['残り分']:.0f}分")
+                d.metric('優先券種',r['優先券種'])
+                e.markdown(f"### {r['優先買い目']}")
+                x1,x2,x3,x4=st.columns(4)
+                x1.metric('高確率案',f"{r['高確率券種']} {r['高確率買い目']}")
+                x2.metric('高確率AI',f"{r['高確率確率%']:.2f}%")
+                x3.metric('高期待値案',f"{r['高期待値券種']} {r['高期待値買い目']}")
+                x4.metric('高期待値EV',f"{r['高期待値期待値']:.2f}" if pd.notna(r['高期待値期待値']) else '—')
+                st.info(f"優先：{r['優先券種']} {r['優先買い目']} ／ 実オッズ {r['優先オッズ']:.1f}倍 ／ EV {r['優先期待値']:.2f} ／ {r['優先理由']}")
 
-st.divider();st.header('本日の券種・買い目判断')
-if races.empty:st.warning('実オッズまで揃った候補がありません。');st.stop()
-headline=races[races['参考候補']].sort_values(['残り分','優先期待値'],ascending=[True,False])
-if headline.empty:st.warning('現在、安全補正期待値1.10以上・過去選別条件・券種信頼度をすべて満たす候補はありません。')
-else:
-    for _,r in headline.head(5).iterrows():
-        with st.container(border=True):
-            a,b,c,d,e=st.columns([1.0,1.3,1.1,1.2,1.4])
-            (a.success if r['判断']=='買い' else a.warning)(f"## {r['判断']}")
-            b.markdown(f"### {r['場']} {int(r['R'])}R")
-            c.metric('締切まで',f"{r['残り分']:.0f}分")
-            d.metric('優先券種',r['優先券種'])
-            e.markdown(f"### {r['優先買い目']}")
-            st.markdown('#### 高確率寄り')
-            x1,x2,x3,x4=st.columns(4);x1.metric('券種',r['高確率券種']);x2.metric('買い目',r['高確率買い目']);x3.metric('安全補正AI確率',f"{r['高確率確率%']:.2f}%");x4.metric('期待値',f"{r['高確率期待値']:.2f}" if pd.notna(r['高確率期待値']) else '—')
-            st.markdown('#### 高期待値寄り')
-            y1,y2,y3,y4=st.columns(4);y1.metric('券種',r['高期待値券種']);y2.metric('買い目',r['高期待値買い目']);y3.metric('安全補正AI確率',f"{r['高期待値確率%']:.2f}%");y4.metric('期待値',f"{r['高期待値期待値']:.2f}" if pd.notna(r['高期待値期待値']) else '—')
-            st.info(f"優先：{r['優先券種']} {r['優先買い目']} ／ {r['優先理由']} ／ 実オッズ {r['優先オッズ']:.1f}倍 ／ EV {r['優先期待値']:.2f}")
-            if r['オッズ更新']=='直前再取得':st.caption('締切30分以内のため直前オッズで再判定')
-
-st.subheader('全評価レース')
-st.dataframe(races[['判断','場','R','締切','残り分','優先券種','優先買い目','優先確率%','優先オッズ','優先期待値','高確率券種','高確率買い目','高期待値券種','高期待値買い目','オッズ更新','取得券種数']].sort_values('残り分'),use_container_width=True,hide_index=True)
-
+with st.expander('条件別の得意不得意学習',expanded=False):
+    ctx_cols=st.columns(4)
+    ctx_dims=[('venue_ctx','競艇場別'),('lane1_ctx','1号艇条件'),('race_ctx','レース帯'),('wind_ctx','風条件')]
+    for ci,(dim,label) in enumerate(ctx_dims):
+        vals=[]
+        for key,stat in ((context_stats.get('3t',{}) or {}).get(dim,{}) or {}).items():
+            if int(stat.get('samples',0))>=25:
+                vals.append((float(stat.get('factor',1.0)),key,int(stat.get('samples',0))))
+        if vals:
+            f,key,n=sorted(vals)[0]
+            ctx_cols[ci].metric(label,f'弱点: {key}',delta=f'補正×{f:.2f} / {n}件')
+        else:
+            ctx_cols[ci].metric(label,'学習中')
+    st.caption('不得意条件は未見予測での実的中率/予測確率を使い、確率を下げる方向にだけ補正します。')
 # Live log: only 3連単 can use existing ledger settlement format without adding result parsing for other ticket types.
 # v2.11 therefore logs all displayed recommendations to a separate generic CSV, while legacy 3t ledger remains intact.
 log_path='data/v211_recommendations.csv'
@@ -204,7 +236,7 @@ if not oldlog.empty:newlog=pd.concat([oldlog,newlog],ignore_index=True).drop_dup
 try:newlog.to_csv(log_path,index=False,encoding='utf-8-sig')
 except Exception:pass
 
-st.divider();st.header('券種別詳細')
+st.divider();st.header('券種別詳細（必要なときだけ確認）')
 rid=st.selectbox('レースを選択',list(details.keys()),format_func=lambda x:f"{x} / {base.loc[base['race_id']==x,'場'].iloc[0]} {int(base.loc[base['race_id']==x,'R'].iloc[0])}R")
 for code in ('3t','3f','2t','2f'):
     df=details[rid][code].copy().sort_values(['expected_value','prob'],ascending=False,na_position='last')
@@ -223,4 +255,4 @@ with st.expander('学習・校正・未見検証の詳細'):
 st.subheader('AI再学習')
 if st.button('最新結果で再学習する'):
     st.cache_data.clear();st.cache_resource.clear();st.success('キャッシュを消去しました。再読込すると公開済み最新結果まで含めて再学習します。')
-st.caption('v2.11.2は券種別校正に加え、競艇場・1号艇条件・レース帯・風波条件の未見実績から不得意条件だけを自動減点します。市場のオッズ帯・人気帯は現在は保守的リスク補正として使用し、履歴蓄積後に学習補正へ移行します。未見回収率ゲート不合格時は実戦購入候補を出しません。')
+st.caption('v2.11.3は購入判断を1ページ一覧へ集約し、詳細学習情報は折りたたみ表示にしました。予測ロジックはv2.11.2を維持しています。')
