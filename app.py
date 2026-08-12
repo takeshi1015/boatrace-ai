@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 
 from src.data import fetch_today,flatten,historical_dataset,fetch_results_for_dates
-from src.model import fit_models,trifecta_table,selection_signals
+from src.model import fit_models,trifecta_table,selection_signals,race_data_quality
 from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize
 from src.calibration import fit_probability_calibrator,calibrate_distribution,fit_ticket_calibrators,calibrate_ticket_table,ticket_reliability_gate
 from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticket_candidates,priority_candidate,TICKET_NAMES
@@ -13,11 +13,11 @@ from src.context_reliability import fit_context_reliability,current_race_context
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.11.4'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.12.0'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-st.set_page_config(page_title='BOAT RACE AI v2.11.4',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.12.0',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.11.4：購入判断1画面完成版＋条件別得意不得意学習＋市場リスク補正')
+st.caption('v2.12.0：予測精度・学習能力強化（直近重み＋実績事前分布＋展示データ品質ゲート）')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2=st.columns([4,1])
@@ -103,15 +103,19 @@ for rid,g in valid.groupby('race_id'):
         rid=str(rid);race_groups[rid]=g.copy()
         raw_ticket_tables=probability_tables_from_trifecta(tri)
         race_ctx=current_race_context(g,tri)
+        dq=race_data_quality(g)
         adjusted={}
         for code,df in raw_ticket_tables.items():
             z=calibrate_ticket_table(df,code,ticket_calibrators,ticket_stats)
             cf,_=context_factor(code,race_ctx,context_stats,min_samples=25)
             z=apply_context_factor(z,cf)
+            z['data_quality_factor']=float(dq['factor'])
+            z['prob']=np.clip(pd.to_numeric(z['prob'],errors='coerce').fillna(0)*float(dq['factor']),1e-6,1-1e-6)
+            z['prob_pct']=z['prob']*100
             adjusted[code]=z
         prob_tables[rid]=adjusted
         race_groups[rid]['context_info']=[race_ctx]*len(race_groups[rid])
-        base_rows.append({'race_id':rid,'race_date':g['race_date'].iloc[0],'場':g['venue'].iloc[0],'R':int(g['race_no'].iloc[0]),'締切':pd.Timestamp(g['closed_at_jst'].iloc[0]).strftime('%H:%M'),'残り分':float(g['minutes_left'].iloc[0]),'AI1位':top['combo'],'校正AI確率%':float(top['prob']*100),'利益選別スコア':float(score),'過去条件通過':bool(rule_pass),'確信度':float(sig['confidence'])})
+        base_rows.append({'race_id':rid,'race_date':g['race_date'].iloc[0],'場':g['venue'].iloc[0],'R':int(g['race_no'].iloc[0]),'締切':pd.Timestamp(g['closed_at_jst'].iloc[0]).strftime('%H:%M'),'残り分':float(g['minutes_left'].iloc[0]),'AI1位':top['combo'],'校正AI確率%':float(top['prob']*100),'利益選別スコア':float(score),'過去条件通過':bool(rule_pass),'確信度':float(sig['confidence']),'データ準備完了':bool(dq['ready']),'データ品質係数':float(dq['factor']),'データ品質理由':str(dq['reason'])})
     except Exception:pass
 base=pd.DataFrame(base_rows)
 if base.empty:st.info('現在、購入時間を確保できる評価対象レースはありません。');st.stop()
@@ -152,12 +156,12 @@ for _,r in pool.iterrows():
     complete=sum(int(merged[c]['odds'].notna().sum()>0) for c in merged)
     pcode=priority.get('ticket_code')
     tgate=ticket_gate.get(pcode,{})
-    reference=bool(r['過去条件通過'] and tgate.get('passed') and pd.notna(priority.get('expected_value')) and float(priority['expected_value'])>=MIN_EV)
+    reference=bool(r['過去条件通過'] and bool(r.get('データ準備完了',False)) and tgate.get('passed') and pd.notna(priority.get('expected_value')) and float(priority['expected_value'])>=MIN_EV)
     final_buy=bool(gate['passed'] and reference)
     def fields(x,prefix):
         if x is None:return {prefix+'券種':'—',prefix+'買い目':'—',prefix+'確率%':np.nan,prefix+'オッズ':np.nan,prefix+'期待値':np.nan}
         return {prefix+'券種':x['ticket'],prefix+'買い目':x['combo'],prefix+'確率%':float(x['prob']*100),prefix+'オッズ':x.get('odds'),prefix+'期待値':x.get('expected_value')}
-    row={'race_id':rid,'race_date':r['race_date'],'場':r['場'],'R':r['R'],'締切':r['締切'],'残り分':r['残り分'],'判断':'買い' if final_buy else '見送り','優先券種':priority['ticket'],'優先買い目':priority['combo'],'優先確率%':float(priority['prob']*100),'優先オッズ':priority.get('odds'),'優先期待値':priority.get('expected_value'),'優先理由':priority_reason,'利益選別スコア':r['利益選別スコア'],'過去条件通過':r['過去条件通過'],'オッズ更新':mode,'取得券種数':complete,'参考候補':reference,'実戦候補':final_buy,'確信度':r['確信度']}
+    row={'race_id':rid,'race_date':r['race_date'],'場':r['場'],'R':r['R'],'締切':r['締切'],'残り分':r['残り分'],'判断':'買い' if final_buy else '見送り','優先券種':priority['ticket'],'優先買い目':priority['combo'],'優先確率%':float(priority['prob']*100),'優先オッズ':priority.get('odds'),'優先期待値':priority.get('expected_value'),'優先理由':priority_reason,'利益選別スコア':r['利益選別スコア'],'過去条件通過':r['過去条件通過'],'オッズ更新':mode,'取得券種数':complete,'参考候補':reference,'実戦候補':final_buy,'確信度':r['確信度'],'データ準備完了':bool(r.get('データ準備完了',False)),'データ品質係数':r.get('データ品質係数',np.nan),'データ品質理由':r.get('データ品質理由','—')}
     row.update(fields(safe,'高確率'));row.update(fields(value,'高期待値'));race_rows.append(row)
 races=pd.DataFrame(race_rows)
 

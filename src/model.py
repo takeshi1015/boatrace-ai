@@ -1,5 +1,6 @@
 from __future__ import annotations
 import itertools
+import math
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
@@ -19,16 +20,34 @@ BASE_FEATURES=[
     'air_temperature','water_temperature',
 ]
 RELATIVE_COLS=[
-    'racer_win_rate','racer_2ren_rate','local_win_rate',
-    'motor_2ren_rate','boat_2ren_rate',
-    'avg_start','preview_start_timing','exhibition_time',
+    'racer_win_rate','racer_2ren_rate','racer_3ren_rate','local_win_rate','local_2ren_rate',
+    'motor_2ren_rate','boat_2ren_rate','avg_start','preview_start_timing','exhibition_time',
 ]
-FEATURES=BASE_FEATURES+[f'{c}_rel' for c in RELATIVE_COLS]+[
-    'inside_lane','course_shift','start_advantage','exhibition_advantage'
+RANK_COLS=[
+    'racer_win_rate','racer_2ren_rate','local_win_rate','motor_2ren_rate','boat_2ren_rate',
 ]
+FEATURES=BASE_FEATURES+[f'{c}_rel' for c in RELATIVE_COLS]+[f'{c}_rank' for c in RANK_COLS]+[
+    'inside_lane','lane_sq','course_shift','course_shift_abs','course_inside',
+    'start_advantage','exhibition_advantage','start_rank','exhibition_rank',
+    'local_vs_national','motor_boat_strength','racer_form_strength',
+    'preview_complete','weather_complete','race_progress',
+]
+
 
 def _numeric(s):
     return pd.to_numeric(s,errors='coerce')
+
+
+def _race_pct_rank(a,col,ascending=False):
+    if col not in a:
+        return pd.Series(np.nan,index=a.index)
+    x=_numeric(a[col])
+    if 'race_id' not in a:
+        return x.rank(pct=True,ascending=ascending)
+    # 1.0 = best in field for intuitive monotonicity
+    r=x.groupby(a['race_id']).rank(pct=True,ascending=ascending,method='average')
+    return 1.0-r+1.0/6.0 if not ascending else 1.0-r+1.0/6.0
+
 
 def feature_frame(df):
     a=df.copy()
@@ -36,14 +55,17 @@ def feature_frame(df):
     a['course']=_numeric(a.get('course',a.get('lane')))
     a['course']=a['course'].fillna(_numeric(a.get('lane')))
     a['inside_lane']=7-_numeric(a.get('lane'))
+    a['lane_sq']=_numeric(a.get('lane'))**2
     a['course_shift']=_numeric(a['course'])-_numeric(a.get('lane'))
+    a['course_shift_abs']=a['course_shift'].abs()
+    a['course_inside']=7-_numeric(a['course'])
+    a['race_progress']=(_numeric(a.get('race_no'))-1)/11.0
 
     for c in BASE_FEATURES:
         if c not in a:
             a[c]=np.nan
         a[c]=_numeric(a[c])
 
-    # relative-to-field features are important in a 6-boat race
     if 'race_id' in a:
         grouped=a.groupby('race_id')
         for c in RELATIVE_COLS:
@@ -53,9 +75,29 @@ def feature_frame(df):
         for c in RELATIVE_COLS:
             a[f'{c}_rel']=a[c]-a[c].mean()
 
-    # Lower ST/exhibition time is better, hence invert relative sign
+    # Lower ST/exhibition time is better, hence invert relative sign.
     a['start_advantage']=-a['preview_start_timing_rel']
     a['exhibition_advantage']=-a['exhibition_time_rel']
+
+    # Field ranks are robust to venue/season scale changes. 1.0 is best.
+    if 'race_id' in a:
+        for c in RANK_COLS:
+            # larger is better
+            a[f'{c}_rank']=a.groupby('race_id')[c].rank(pct=True,ascending=True)
+        # smaller is better
+        a['start_rank']=1.0-a.groupby('race_id')['preview_start_timing'].rank(pct=True,ascending=True)+1/6
+        a['exhibition_rank']=1.0-a.groupby('race_id')['exhibition_time'].rank(pct=True,ascending=True)+1/6
+    else:
+        for c in RANK_COLS:
+            a[f'{c}_rank']=a[c].rank(pct=True,ascending=True)
+        a['start_rank']=1.0-a['preview_start_timing'].rank(pct=True,ascending=True)+1/6
+        a['exhibition_rank']=1.0-a['exhibition_time'].rank(pct=True,ascending=True)+1/6
+
+    a['local_vs_national']=a['local_win_rate']-a['racer_win_rate']
+    a['motor_boat_strength']=0.65*a['motor_2ren_rate']+0.35*a['boat_2ren_rate']
+    a['racer_form_strength']=0.55*a['racer_win_rate']+0.25*a['local_win_rate']+0.20*a['racer_2ren_rate']
+    a['preview_complete']=a[['course','preview_start_timing','exhibition_time']].notna().mean(axis=1)
+    a['weather_complete']=a[['wind_speed','wave_height_cm','air_temperature','water_temperature']].notna().mean(axis=1)
 
     for c in FEATURES:
         if c not in a:
@@ -63,14 +105,59 @@ def feature_frame(df):
         a[c]=_numeric(a[c])
     return a[FEATURES]
 
+
 def _make_classifier():
     return Pipeline([
         ('imp',SimpleImputer(strategy='median')),
         ('clf',HistGradientBoostingClassifier(
-            max_iter=160,max_depth=5,learning_rate=.05,
-            l2_regularization=1.5,random_state=42
+            max_iter=190,max_depth=5,learning_rate=.045,
+            min_samples_leaf=28,l2_regularization=2.2,
+            random_state=42
         ))
     ])
+
+
+def _recency_weights(h, half_life_days=50):
+    if 'race_date' not in h:
+        return np.ones(len(h),dtype=float)
+    d=pd.to_datetime(h['race_date'],errors='coerce')
+    if not d.notna().any():
+        return np.ones(len(h),dtype=float)
+    age=(d.max()-d).dt.total_seconds().fillna(0)/86400.0
+    w=np.exp(-math.log(2)*np.maximum(age,0)/half_life_days)
+    # Avoid effectively deleting older history; it remains useful for rare contexts.
+    return np.clip(np.asarray(w,float),0.25,1.0)
+
+
+def _weighted_group_prior(h, keys, target, weights, prior_strength=60):
+    tmp=h.copy()
+    tmp['_target']=target.astype(float).to_numpy()
+    tmp['_w']=weights
+    global_rate=float(np.average(tmp['_target'],weights=tmp['_w'])) if len(tmp) else 1/6
+    tmp['_wy']=tmp['_w']*tmp['_target']
+    gr=tmp.groupby(keys,dropna=False).agg(_sw=('_w','sum'),_sy=('_wy','sum'),_n=('_target','size')).reset_index()
+    gr['rate']=(gr['_sy']+prior_strength*global_rate)/(gr['_sw']+prior_strength)
+    mapping={}
+    for _,r in gr.iterrows():
+        k=tuple(r[x] for x in keys) if len(keys)>1 else r[keys[0]]
+        mapping[k]=(float(r['rate']),int(r['_n']))
+    return {'map':mapping,'global':global_rate,'keys':keys,'prior_strength':prior_strength}
+
+
+def _build_priors(h, weights):
+    priors={}
+    finish=pd.to_numeric(h['finish_num'],errors='coerce')
+    for place in (1,2,3):
+        y=(finish==place).astype(int)
+        priors[place]={
+            'venue_lane':_weighted_group_prior(h,['stadium_no','lane'],y,weights,45),
+            'venue_course':_weighted_group_prior(h,['stadium_no','course'],y,weights,45),
+            'racer':_weighted_group_prior(h,['racer_id'],y,weights,80),
+            'motor':_weighted_group_prior(h,['stadium_no','motor_no'],y,weights,70),
+            'rank':_weighted_group_prior(h,['rank_number'],y,weights,60),
+        }
+    return priors
+
 
 def fit_models(hist):
     if hist is None or hist.empty or 'finish_num' not in hist:
@@ -79,15 +166,20 @@ def fit_models(hist):
     if h['race_id'].nunique()<100:
         return None
     X=feature_frame(h)
+    weights=_recency_weights(h,half_life_days=50)
     models={}
-    for place,target in [(1,'is_first'),(2,'is_second'),(3,'is_third')]:
+    for place in (1,2,3):
         y=(pd.to_numeric(h['finish_num'],errors='coerce')==place).astype(int)
         if y.sum()<30:
             return None
         m=_make_classifier()
-        m.fit(X,y)
+        # Recent races matter more, while older races still retain a floor weight.
+        m.fit(X,y,clf__sample_weight=weights)
         models[place]=m
+    models['_priors']=_build_priors(h,weights)
+    models['_meta']={'half_life_days':50,'train_races':int(h['race_id'].nunique()),'train_rows':int(len(h))}
     return models
+
 
 def _fallback_scores(g, place):
     lane=_numeric(g['lane']).fillna(3.5)
@@ -102,17 +194,81 @@ def _fallback_scores(g, place):
         base=.28*wr+.55*mot+.03*(7-lane)-.15*(ex-ex.mean())
     return np.exp(base-np.nanmax(base))
 
+
+def _prior_value(spec,row):
+    if not spec:return 1/6,0
+    keys=spec.get('keys',[])
+    try:
+        if len(keys)>1:key=tuple(row.get(k) for k in keys)
+        else:key=row.get(keys[0])
+        return spec.get('map',{}).get(key,(spec.get('global',1/6),0))
+    except Exception:
+        return spec.get('global',1/6),0
+
+
+def _blend_with_priors(raw,g,place,priors):
+    if not priors or place not in priors:return raw
+    cfg=priors[place]
+    exponents={
+        'venue_lane':0.20 if place==1 else 0.13,
+        'venue_course':0.12 if place==1 else 0.10,
+        'racer':0.14,
+        'motor':0.08,
+        'rank':0.06,
+    }
+    out=np.maximum(np.asarray(raw,float),1e-8).copy()
+    for i,(_,row) in enumerate(g.reset_index(drop=True).iterrows()):
+        multiplier=1.0
+        for name,expo in exponents.items():
+            spec=cfg.get(name,{})
+            rate,n=_prior_value(spec,row)
+            glob=max(float(spec.get('global',1/6)),1e-6)
+            # sample reliability further damps small empirical groups
+            reliability=min(1.0,math.sqrt(max(n,0)/80.0))
+            ratio=float(np.clip(rate/glob,0.60,1.65))
+            multiplier*=ratio**(expo*reliability)
+        out[i]*=float(np.clip(multiplier,0.62,1.55))
+    return out
+
+
 def place_scores(models,g):
     out={}
     xf=feature_frame(g)
+    priors=(models or {}).get('_priors',{}) if isinstance(models,dict) else {}
     for place in (1,2,3):
         if models is None or place not in models:
             raw=_fallback_scores(g,place)
         else:
             raw=models[place].predict_proba(xf)[:,1]
+        raw=_blend_with_priors(raw,g,place,priors)
         raw=np.maximum(np.asarray(raw,float),1e-8)
         out[place]=raw
     return out
+
+
+def race_data_quality(g):
+    """Return readiness of the genuinely pre-race information.
+
+    A race can still be scored with imputers, but it must not become a real buy
+    candidate until course, exhibition ST and exhibition time are mostly present.
+    """
+    if g is None or len(g)==0:
+        return {'ready':False,'factor':0.70,'preview_ratio':0.0,'weather_ratio':0.0,'reason':'展示データなし'}
+    key=['course','preview_start_timing','exhibition_time']
+    avail=[]
+    for c in key:
+        if c in g:avail.append(float(pd.to_numeric(g[c],errors='coerce').notna().mean()))
+        else:avail.append(0.0)
+    preview_ratio=float(np.mean(avail))
+    weather=[]
+    for c in ['wind_speed','wave_height_cm','air_temperature','water_temperature']:
+        weather.append(float(pd.to_numeric(g.get(c,pd.Series(index=g.index,dtype=float)),errors='coerce').notna().mean()))
+    weather_ratio=float(np.mean(weather))
+    factor=float(np.clip(0.72+0.23*preview_ratio+0.05*weather_ratio,0.72,1.0))
+    ready=bool(min(avail)>=5/6 and preview_ratio>=0.90)
+    reason='OK' if ready else f'展示/ST/進入不足 ({preview_ratio*100:.0f}%)'
+    return {'ready':ready,'factor':factor,'preview_ratio':preview_ratio,'weather_ratio':weather_ratio,'reason':reason}
+
 
 def trifecta_table(models,g):
     scores=place_scores(models,g)
@@ -120,9 +276,6 @@ def trifecta_table(models,g):
     idx={lane:i for i,lane in enumerate(lanes)}
     rows=[]
     for a,b,c in itertools.permutations(lanes,3):
-        # sequential conditional normalization:
-        # first model for 1st; second-place model among remaining;
-        # third-place model among remaining after first+second.
         s1=scores[1]
         p1=s1[idx[a]]/s1.sum()
 
@@ -141,6 +294,7 @@ def trifecta_table(models,g):
         df['prob']/=total
     return df.sort_values('prob',ascending=False).reset_index(drop=True)
 
+
 def race_confidence(tri):
     if tri is None or tri.empty:
         return 0.0
@@ -150,7 +304,6 @@ def race_confidence(tri):
 
 
 def selection_signals(tri):
-    """Pre-race signals used by the second-stage bet selector."""
     if tri is None or tri.empty:
         return {
             'top_prob':0.0,'prob_margin':0.0,'confidence':0.0,
