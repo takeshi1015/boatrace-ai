@@ -3,6 +3,7 @@ import itertools
 import pandas as pd
 from .model import fit_models, trifecta_table, selection_signals
 from .tickets import probability_tables_from_trifecta
+from .profit_reliability import fit_race_profit_filter,apply_race_profit_filter
 
 def generate_walk_forward_predictions(hist, min_train_days=35, test_days=7, max_test_days=49):
     if hist is None or hist.empty:
@@ -484,7 +485,19 @@ def strict_nested_selector_backtest(
         if rule is None:
             continue
 
-        chosen = _apply_rule(test, rule)
+        chosen_before_profit = _apply_rule(test, rule)
+
+        # ⑤ Profitability filter:
+        # learn weak race conditions only from this fold's historical training rows,
+        # then apply them to the future test rows. Test outcomes are never used
+        # to decide which conditions are excluded.
+        profit_model = fit_race_profit_filter(train, min_samples=30, prior=100)
+        chosen = apply_race_profit_filter(
+            chosen_before_profit,
+            profit_model,
+            min_factor=0.88,
+            min_samples=30,
+        )
         test_stats = summarize(chosen)
 
         fold_rows.append({
@@ -497,6 +510,8 @@ def strict_nested_selector_backtest(
             "train_bets": train_stats.get("races", 0),
             "train_roi": train_stats.get("roi", 0),
             "train_shrunk_roi": train_stats.get("shrunk_roi", 0),
+            "test_bets_before_profit_filter": int(len(chosen_before_profit)),
+            "profit_filter_removed": int(max(0,len(chosen_before_profit)-len(chosen))),
             "test_bets": test_stats.get("races", 0),
             "test_hit_rate": test_stats.get("hit_rate", 0),
             "test_roi": test_stats.get("roi", 0),

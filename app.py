@@ -10,24 +10,26 @@ from src.backtest import generate_walk_forward_predictions,nested_selector_backt
 from src.calibration import fit_probability_calibrator,calibrate_distribution,fit_ticket_calibrators,calibrate_ticket_table,ticket_reliability_gate
 from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticket_candidates,priority_candidate,TICKET_NAMES
 from src.context_reliability import fit_context_reliability,current_race_context,context_factor,apply_context_factor,apply_market_overlay
+from src.profit_reliability import fit_race_profit_filter,row_profit_factor,current_profit_context,summarize_profit_model
 from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 from src.persistence import save_pickle,load_pickle,remove_pickle,export_learning_snapshot,import_learning_snapshot,cache_file_exists
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3d'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3e'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
 SNAPSHOT_VERSION='v2133c-assets-strict-oos-2'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
-st.set_page_config(page_title='BOAT RACE AI v2.13.3d',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.13.3e',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.3d：①保存・復元＋②増分学習＋③厳格未見検証＋④分割・再開可能な高速化')
+st.caption('v2.13.3e：⑤赤字条件除外・期間外利益フィルタ（①〜④は維持）')
 now=pd.Timestamp.now(tz=JST)
 
-c1,c2,c3,c4=st.columns([2.7,1,1.25,1.45])
+c1,c2,c3,c4,c5=st.columns([2.45,0.95,1.15,1.35,1.25])
 c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
 if c2.button('当日データ・オッズ更新',use_container_width=True):
     st.rerun()
 incremental_clicked=c3.button('新規結果だけモデル更新',use_container_width=True,type='secondary')
 retrain_clicked=c4.button('完全再学習を1段階進める',use_container_width=True,type='secondary')
+profit_recheck_clicked=c5.button('⑤利益フィルタ再評価',use_container_width=True,type='secondary')
 
 
 with st.expander('① 学習スナップショットの保存・復元', expanded=False):
@@ -373,8 +375,38 @@ if today.empty:st.warning('本日のレースデータがありません。');st
 hist=load_hist();models,model_source=load_models_cached()
 _assets,learning_mode,learning_source=load_learning_assets_cached()
 preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate,context_stats=_assets
+
+# ⑤ uses only the already-created OOS predictions, so it is much lighter than
+# refitting the underlying race model. The strict nested validator learns the
+# profitability filter on each past fold and applies it only to the future fold.
+if profit_recheck_clicked:
+    if preds is None or preds.empty:
+        st.error('未見予測データがありません。先に完全再学習を完了してください。')
+        st.stop()
+    with st.status('⑤ 過去期間だけで赤字条件を学習し、未来側で再評価しています…',expanded=True) as rs:
+        new_selected,new_metrics,new_folds=strict_nested_selector_backtest(
+            preds,lookback_days=56,step_days=7,min_bets=80,min_selector_days=56,embargo_days=1
+        )
+        new_gate=deployment_gate_strict(
+            new_metrics,new_folds,selected=new_selected,
+            min_oos_bets=200,min_oos_roi=1.00,
+            min_positive_fold_ratio=0.55,min_recent_fold_ratio=0.50,
+            min_median_fold_roi=0.95,max_profit_concentration=0.55,
+        )
+        new_rule,new_rstats=fit_current_selector(preds,lookback_days=180,min_bets=100)
+        new_assets=(preds,new_selected,new_metrics,new_folds,new_gate,new_rule,new_rstats,
+                    calibrator,cal_stats,ticket_calibrators,ticket_stats,ticket_gate,context_stats)
+        save_pickle('learning_assets',new_assets,{'version':SNAPSHOT_VERSION,'mode':'profit_filter_v1'})
+        rs.update(
+            label=f"⑤再評価完了：未見{new_gate.get('oos_bets',0)}件 / 回収率{new_gate.get('oos_roi',0)*100:.1f}%",
+            state='complete'
+        )
+    st.cache_resource.clear()
+    st.rerun()
+
 base_stats=summarize(preds)
 temporal_stats=temporal_profit_summary(selector_bt)
+profit_model=fit_race_profit_filter(preds,min_samples=30,prior=100) if preds is not None and not preds.empty else {}
 if gate.get('oos_bets',0)==0:
     st.warning('③厳格未見利益検証は未実施です。「完全再学習＋未見検証」を1回実行すると、1日エンバーゴ付きの検証結果を保存します。0.0%を実績値としては扱いません。')
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
@@ -430,7 +462,7 @@ with st.expander('学習状況・券種別信頼度・条件別弱点（詳細�
         q2.metric('中央値回収率',f"{gate.get('median_fold_roi',0)*100:.1f}%")
         q3.metric('最大利益偏り',f"{gate.get('profit_concentration',1)*100:.1f}%")
         q4.metric('最大ドローダウン',f"{gate.get('max_drawdown_yen',0):,.0f}円")
-        st.caption('③厳格未見検証：各テスト期間の直前1日を学習から除外し、ルール選定は必ず過去期間だけで行います。総回収率だけでなく、期間黒字率・中央値・利益偏り・直近安定性も実戦ゲートに使用します。')
+        st.caption('③+⑤厳格未見検証：各テスト期間では、購入ルールと赤字条件除外の両方を必ず過去データだけで学習し、未来側へ適用します。総回収率だけでなく期間安定性もゲートに使用します。')
     if cal_stats.get('brier_raw') is not None:
         delta=cal_stats['brier_raw']-cal_stats['brier_cal']
         st.caption(f"確率校正 Brier: 校正前 {cal_stats['brier_raw']:.4f} → 校正後 {cal_stats['brier_cal']:.4f}（改善 {delta:+.4f}）")
@@ -444,6 +476,18 @@ with st.expander('学習状況・券種別信頼度・条件別弱点（詳細�
         st.caption('直近30日を最重視しつつ、90日・180日・長期でも崩れない購入条件を優先します。短期だけ偶然黒字の条件は採用しにくくしています。')
     if isinstance(current_stats,dict) and current_stats.get('window_stats'):
         st.caption('現在ルールの期間別検証: '+ ' / '.join([f"{x['window_days']}日: {x['bets']}件 ROI{x['roi']*100:.1f}%" for x in current_stats['window_stats']]))
+    st.subheader('⑤ 赤字条件の利益学習')
+    bad_profit=summarize_profit_model(profit_model,topn=8)
+    if bad_profit is not None and not bad_profit.empty:
+        bp=bad_profit.copy()
+        bp['実回収率']=bp['実回収率'].map(lambda x:f'{x*100:.1f}%')
+        bp['縮小回収率']=bp['縮小回収率'].map(lambda x:f'{x*100:.1f}%')
+        bp['補正係数']=bp['補正係数'].map(lambda x:f'{x:.2f}')
+        st.dataframe(bp,use_container_width=True,hide_index=True)
+        st.caption('この表は未見予測の過去側データだけから学習した「モデルが苦手なレース条件」です。現在予想では確率を下げるだけで、良い条件を過度に持ち上げることはしません。')
+    else:
+        st.caption('利益条件の学習サンプルがまだ不足しています。')
+
     st.subheader('券種別の未見確率信頼度')
     rg=st.columns(4)
     for i,code in enumerate(('3t','3f','2t','2f')):
@@ -474,18 +518,40 @@ for rid,g in valid.groupby('race_id'):
         raw_ticket_tables=probability_tables_from_trifecta(tri)
         race_ctx=current_race_context(g,tri)
         dq=race_data_quality(g)
+
+        # Current race profitability context. This is learned from historical
+        # walk-forward predictions, never from today's result.
+        wind_now=pd.to_numeric(g.get('wind_speed'),errors='coerce').dropna()
+        wave_now=pd.to_numeric(g.get('wave_height_cm'),errors='coerce').dropna()
+        pcurr=current_profit_context(
+            venue=str(g['venue'].iloc[0]),
+            race_no=int(g['race_no'].iloc[0]),
+            lane1_first_prob=float(race_ctx.get('lane1_first_prob',0)),
+            first_lane=int(sig['first_lane']) if sig.get('first_lane') is not None else np.nan,
+            prob=float(top['prob']),
+            confidence=float(sig['confidence']),
+            wind_speed=float(wind_now.iloc[0]) if len(wind_now) else np.nan,
+            wave_height_cm=float(wave_now.iloc[0]) if len(wave_now) else np.nan,
+        )
+        pf,pblocked,pdetails=row_profit_factor(pcurr,profit_model,min_samples=30)
         adjusted={}
         for code,df in raw_ticket_tables.items():
             z=calibrate_ticket_table(df,code,ticket_calibrators,ticket_stats)
             cf,_=context_factor(code,race_ctx,context_stats,min_samples=25)
             z=apply_context_factor(z,cf)
+            z['profit_context_factor']=float(pf)
+            z['profit_context_block']=bool(pblocked)
             z['data_quality_factor']=float(dq['factor'])
-            z['prob']=np.clip(pd.to_numeric(z['prob'],errors='coerce').fillna(0)*float(dq['factor']),1e-6,1-1e-6)
+            z['prob']=np.clip(
+                pd.to_numeric(z['prob'],errors='coerce').fillna(0)
+                *float(pf)*float(dq['factor']),
+                1e-6,1-1e-6
+            )
             z['prob_pct']=z['prob']*100
             adjusted[code]=z
         prob_tables[rid]=adjusted
         race_groups[rid]['context_info']=[race_ctx]*len(race_groups[rid])
-        base_rows.append({'race_id':rid,'race_date':g['race_date'].iloc[0],'場':g['venue'].iloc[0],'R':int(g['race_no'].iloc[0]),'締切':pd.Timestamp(g['closed_at_jst'].iloc[0]).strftime('%H:%M'),'残り分':float(g['minutes_left'].iloc[0]),'AI1位':top['combo'],'校正AI確率%':float(top['prob']*100),'利益選別スコア':float(score),'過去条件通過':bool(rule_pass),'確信度':float(sig['confidence']),'データ準備完了':bool(dq['ready']),'データ品質係数':float(dq['factor']),'データ品質理由':str(dq['reason'])})
+        base_rows.append({'race_id':rid,'race_date':g['race_date'].iloc[0],'場':g['venue'].iloc[0],'R':int(g['race_no'].iloc[0]),'締切':pd.Timestamp(g['closed_at_jst'].iloc[0]).strftime('%H:%M'),'残り分':float(g['minutes_left'].iloc[0]),'AI1位':top['combo'],'校正AI確率%':float(top['prob']*100),'利益選別スコア':float(score),'過去条件通過':bool(rule_pass),'確信度':float(sig['confidence']),'データ準備完了':bool(dq['ready']),'データ品質係数':float(dq['factor']),'データ品質理由':str(dq['reason']),'利益条件係数':float(pf),'利益条件除外':bool(pblocked)})
     except Exception:pass
 base=pd.DataFrame(base_rows)
 if base.empty:st.info('現在、購入時間を確保できる評価対象レースはありません。');st.stop()
@@ -526,12 +592,12 @@ for _,r in pool.iterrows():
     complete=sum(int(merged[c]['odds'].notna().sum()>0) for c in merged)
     pcode=priority.get('ticket_code')
     tgate=ticket_gate.get(pcode,{})
-    reference=bool(r['過去条件通過'] and bool(r.get('データ準備完了',False)) and tgate.get('passed') and pd.notna(priority.get('expected_value')) and float(priority['expected_value'])>=MIN_EV)
+    reference=bool(r['過去条件通過'] and bool(r.get('データ準備完了',False)) and (not bool(r.get('利益条件除外',False))) and float(r.get('利益条件係数',1.0))>=0.88 and tgate.get('passed') and pd.notna(priority.get('expected_value')) and float(priority['expected_value'])>=MIN_EV)
     final_buy=bool(gate['passed'] and reference)
     def fields(x,prefix):
         if x is None:return {prefix+'券種':'—',prefix+'買い目':'—',prefix+'確率%':np.nan,prefix+'オッズ':np.nan,prefix+'期待値':np.nan}
         return {prefix+'券種':x['ticket'],prefix+'買い目':x['combo'],prefix+'確率%':float(x['prob']*100),prefix+'オッズ':x.get('odds'),prefix+'期待値':x.get('expected_value')}
-    row={'race_id':rid,'race_date':r['race_date'],'場':r['場'],'R':r['R'],'締切':r['締切'],'残り分':r['残り分'],'判断':'買い' if final_buy else '見送り','優先券種':priority['ticket'],'優先買い目':priority['combo'],'優先確率%':float(priority['prob']*100),'優先オッズ':priority.get('odds'),'優先期待値':priority.get('expected_value'),'優先理由':priority_reason,'利益選別スコア':r['利益選別スコア'],'過去条件通過':r['過去条件通過'],'オッズ更新':mode,'取得券種数':complete,'参考候補':reference,'実戦候補':final_buy,'確信度':r['確信度'],'データ準備完了':bool(r.get('データ準備完了',False)),'データ品質係数':r.get('データ品質係数',np.nan),'データ品質理由':r.get('データ品質理由','—')}
+    row={'race_id':rid,'race_date':r['race_date'],'場':r['場'],'R':r['R'],'締切':r['締切'],'残り分':r['残り分'],'判断':'買い' if final_buy else '見送り','優先券種':priority['ticket'],'優先買い目':priority['combo'],'優先確率%':float(priority['prob']*100),'優先オッズ':priority.get('odds'),'優先期待値':priority.get('expected_value'),'優先理由':priority_reason,'利益選別スコア':r['利益選別スコア'],'過去条件通過':r['過去条件通過'],'オッズ更新':mode,'取得券種数':complete,'参考候補':reference,'実戦候補':final_buy,'確信度':r['確信度'],'データ準備完了':bool(r.get('データ準備完了',False)),'データ品質係数':r.get('データ品質係数',np.nan),'データ品質理由':r.get('データ品質理由','—'),'利益条件係数':r.get('利益条件係数',1.0),'利益条件除外':bool(r.get('利益条件除外',False))}
     row.update(fields(safe,'高確率'));row.update(fields(value,'高期待値'));race_rows.append(row)
 races=pd.DataFrame(race_rows)
 
@@ -652,6 +718,7 @@ for code in ('3t','3f','2t','2f'):
         show=df.head(30).copy();show['安全補正AI確率']=show['prob_pct'].map(lambda x:f'{x:.3f}%');show['実オッズ']=show['odds'].map(lambda x:f'{x:.1f}倍' if pd.notna(x) else '—');show['安全補正期待値']=show['expected_value'].map(lambda x:f'{x:.3f}' if pd.notna(x) else '—')
         if 'effective_factor' in show: show['安全係数']=show['effective_factor'].map(lambda x:f'{x:.3f}')
         if 'context_factor' in show: show['条件補正']=show['context_factor'].map(lambda x:f'{x:.3f}')
+        if 'profit_context_factor' in show: show['利益条件補正']=show['profit_context_factor'].map(lambda x:f'{x:.3f}')
         if 'market_factor' in show: show['市場補正']=show['market_factor'].map(lambda x:f'{x:.3f}')
         cols=['combo','安全補正AI確率','実オッズ','安全補正期待値']+(['安全係数'] if '安全係数' in show else [])+(['条件補正'] if '条件補正' in show else [])+(['市場補正'] if '市場補正' in show else [])+(['odds_band','popularity_band'] if 'odds_band' in show else [])
         st.dataframe(show[cols],use_container_width=True,hide_index=True)
