@@ -433,3 +433,193 @@ def current_buy_score(race_row, rule):
         score *= 0.45
 
     return float(score), bool(passed)
+
+
+def strict_nested_selector_backtest(
+    preds,
+    lookback_days=56,
+    step_days=7,
+    min_bets=80,
+    min_selector_days=56,
+    embargo_days=1,
+):
+    """Leakage-resistant nested walk-forward validation.
+
+    - The base prediction rows are already OOS model predictions.
+    - For each selector fold, the rule is fitted only on earlier prediction dates.
+    - `embargo_days` removes the most recent train dates immediately before test,
+      reducing same-event / same-day regime leakage.
+    - The selector is never optimized on the test fold.
+    """
+    if preds is None or preds.empty:
+        return pd.DataFrame(), {}, pd.DataFrame()
+
+    p = preds.copy()
+    p["date_dt"] = pd.to_datetime(p["race_date"], errors="coerce")
+    p = p[p["date_dt"].notna()].sort_values(["date_dt", "race_id"])
+    dates = sorted(p["date_dt"].dt.normalize().drop_duplicates())
+    if len(dates) < min_selector_days + step_days + embargo_days:
+        return pd.DataFrame(), {}, pd.DataFrame()
+
+    eval_rows = []
+    fold_rows = []
+
+    for i in range(min_selector_days + embargo_days, len(dates), step_days):
+        test_dates = dates[i:i + step_days]
+        if not test_dates:
+            break
+
+        train_end = i - embargo_days
+        train_start = max(0, train_end - lookback_days)
+        train_dates = dates[train_start:train_end]
+
+        train = p[p["date_dt"].dt.normalize().isin(train_dates)].copy()
+        test = p[p["date_dt"].dt.normalize().isin(test_dates)].copy()
+        if train.empty or test.empty:
+            continue
+
+        # Compact but non-trivial minimum so every fold remains testable.
+        fold_min = max(35, min(int(min_bets), int(max(35, len(train) * 0.07))))
+        rule, train_stats = optimize_rule(train, min_bets=fold_min)
+        if rule is None:
+            continue
+
+        chosen = _apply_rule(test, rule)
+        test_stats = summarize(chosen)
+
+        fold_rows.append({
+            "test_start": str(pd.Timestamp(test_dates[0]).date()),
+            "test_end": str(pd.Timestamp(test_dates[-1]).date()),
+            "train_start": str(pd.Timestamp(train_dates[0]).date()) if train_dates else None,
+            "train_end": str(pd.Timestamp(train_dates[-1]).date()) if train_dates else None,
+            "embargo_days": int(embargo_days),
+            **rule,
+            "train_bets": train_stats.get("races", 0),
+            "train_roi": train_stats.get("roi", 0),
+            "train_shrunk_roi": train_stats.get("shrunk_roi", 0),
+            "test_bets": test_stats.get("races", 0),
+            "test_hit_rate": test_stats.get("hit_rate", 0),
+            "test_roi": test_stats.get("roi", 0),
+            "test_profit": test_stats.get("profit", 0),
+        })
+
+        if len(chosen):
+            chosen = chosen.copy()
+            chosen["fold_test_start"] = str(pd.Timestamp(test_dates[0]).date())
+            chosen["fold_test_end"] = str(pd.Timestamp(test_dates[-1]).date())
+            eval_rows.append(chosen)
+
+    out = pd.concat(eval_rows, ignore_index=True) if eval_rows else pd.DataFrame()
+    folds = pd.DataFrame(fold_rows)
+    return out, summarize(out), folds
+
+
+def strict_oos_diagnostics(selected, folds):
+    """Return stability diagnostics for unseen-period profitability."""
+    result = {
+        "bets": 0,
+        "roi": 0.0,
+        "hit_rate": 0.0,
+        "positive_fold_ratio": 0.0,
+        "recent_positive_ratio": 0.0,
+        "median_fold_roi": 0.0,
+        "worst_fold_roi": 0.0,
+        "profit_concentration": 1.0,
+        "max_drawdown_yen": 0.0,
+        "valid_folds": 0,
+    }
+    if selected is None or selected.empty:
+        return result
+
+    s = summarize(selected)
+    result.update({
+        "bets": int(s.get("races", 0)),
+        "roi": float(s.get("roi", 0.0)),
+        "hit_rate": float(s.get("hit_rate", 0.0)),
+    })
+
+    # Sequential drawdown in actual unseen chronological order.
+    x = selected.copy()
+    x["date_dt"] = pd.to_datetime(x.get("race_date"), errors="coerce")
+    x = x.sort_values(["date_dt", "race_id"])
+    profits = pd.to_numeric(x.get("profit_yen"), errors="coerce").fillna(-100.0)
+    equity = profits.cumsum()
+    peak = equity.cummax()
+    dd = equity - peak
+    result["max_drawdown_yen"] = float(abs(dd.min())) if len(dd) else 0.0
+
+    if folds is None or folds.empty:
+        return result
+
+    vf = folds[pd.to_numeric(folds["test_bets"], errors="coerce").fillna(0) >= 10].copy()
+    if vf.empty:
+        return result
+
+    roi = pd.to_numeric(vf["test_roi"], errors="coerce").fillna(0.0)
+    profit = pd.to_numeric(vf["test_profit"], errors="coerce").fillna(0.0)
+
+    result["valid_folds"] = int(len(vf))
+    result["positive_fold_ratio"] = float((roi > 1.0).mean())
+
+    recent = vf.tail(min(4, len(vf)))
+    recent_roi = pd.to_numeric(recent["test_roi"], errors="coerce").fillna(0.0)
+    result["recent_positive_ratio"] = float((recent_roi > 1.0).mean())
+
+    result["median_fold_roi"] = float(roi.median())
+    result["worst_fold_roi"] = float(roi.min())
+
+    pos = profit.clip(lower=0)
+    total_pos = float(pos.sum())
+    if total_pos > 0:
+        result["profit_concentration"] = float(pos.max() / total_pos)
+    else:
+        result["profit_concentration"] = 1.0
+
+    return result
+
+
+def deployment_gate_strict(
+    metrics,
+    folds,
+    selected=None,
+    min_oos_bets=200,
+    min_oos_roi=1.00,
+    min_positive_fold_ratio=0.55,
+    min_recent_fold_ratio=0.50,
+    min_median_fold_roi=0.95,
+    max_profit_concentration=0.55,
+):
+    """Gate for real-use eligibility based on unseen stability, not one lucky fold."""
+    diag = strict_oos_diagnostics(selected, folds)
+    reasons = []
+
+    if diag["bets"] < min_oos_bets:
+        reasons.append(f"未見検証件数が{min_oos_bets}件未満")
+    if diag["roi"] <= min_oos_roi:
+        reasons.append("未見データ総回収率が100%以下")
+    if diag["valid_folds"] < 4:
+        reasons.append("有効な未見期間が4期間未満")
+    if diag["positive_fold_ratio"] < min_positive_fold_ratio:
+        reasons.append(f"未見期間の黒字率が{min_positive_fold_ratio*100:.0f}%未満")
+    if diag["recent_positive_ratio"] < min_recent_fold_ratio:
+        reasons.append("直近未見期間の安定性不足")
+    if diag["median_fold_roi"] < min_median_fold_roi:
+        reasons.append("未見期間の中央値回収率が95%未満")
+    if diag["profit_concentration"] > max_profit_concentration:
+        reasons.append("利益が一部の期間に偏りすぎ")
+
+    return {
+        "passed": len(reasons) == 0,
+        "reasons": reasons,
+        "oos_bets": diag["bets"],
+        "oos_roi": diag["roi"],
+        "oos_hit_rate": diag["hit_rate"],
+        "positive_fold_ratio": diag["positive_fold_ratio"],
+        "recent_positive_ratio": diag["recent_positive_ratio"],
+        "median_fold_roi": diag["median_fold_roi"],
+        "worst_fold_roi": diag["worst_fold_roi"],
+        "profit_concentration": diag["profit_concentration"],
+        "max_drawdown_yen": diag["max_drawdown_yen"],
+        "valid_folds": diag["valid_folds"],
+        "validation_version": "strict-oos-v2",
+    }

@@ -6,7 +6,7 @@ import streamlit as st
 
 from src.data import fetch_today,flatten,historical_dataset,fetch_results_for_dates
 from src.model import fit_models,trifecta_table,selection_signals,race_data_quality
-from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize,temporal_profit_summary
+from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize,temporal_profit_summary,strict_nested_selector_backtest,deployment_gate_strict,strict_oos_diagnostics
 from src.calibration import fit_probability_calibrator,calibrate_distribution,fit_ticket_calibrators,calibrate_ticket_table,ticket_reliability_gate
 from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticket_candidates,priority_candidate,TICKET_NAMES
 from src.context_reliability import fit_context_reliability,current_race_context,context_factor,apply_context_factor,apply_market_overlay
@@ -14,12 +14,12 @@ from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 from src.persistence import save_pickle,load_pickle,remove_pickle,export_learning_snapshot,import_learning_snapshot,cache_file_exists
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3b'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3c'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
-SNAPSHOT_VERSION='v2132-assets-1'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
-st.set_page_config(page_title='BOAT RACE AI v2.13.3b',layout='wide')
+SNAPSHOT_VERSION='v2133c-assets-strict-oos-2'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
+st.set_page_config(page_title='BOAT RACE AI v2.13.3c',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.3b：①保存・復元＋②新規結果の増分モデル更新')
+st.caption('v2.13.3c：①保存・復元＋②増分学習＋③厳格な未見検証')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2,c3,c4=st.columns([2.7,1,1.25,1.45])
@@ -133,8 +133,25 @@ def _build_learning_assets(full=True):
     # requiring only four 28-day model fits. This is strict walk-forward: every
     # evaluated race is predicted by a model trained only on earlier dates.
     preds=generate_walk_forward_predictions(h,min_train_days=35,test_days=28,max_test_days=112)
-    selected,metrics,folds=nested_selector_backtest(preds,lookback_days=35,step_days=7,min_bets=80,min_selector_days=35)
-    gate=deployment_gate(metrics,folds,min_oos_bets=200,min_oos_roi=1.00,min_positive_fold_ratio=0.60,min_recent_fold_ratio=0.50)
+    selected,metrics,folds=strict_nested_selector_backtest(
+        preds,
+        lookback_days=56,
+        step_days=7,
+        min_bets=80,
+        min_selector_days=56,
+        embargo_days=1,
+    )
+    gate=deployment_gate_strict(
+        metrics,
+        folds,
+        selected=selected,
+        min_oos_bets=200,
+        min_oos_roi=1.00,
+        min_positive_fold_ratio=0.55,
+        min_recent_fold_ratio=0.50,
+        min_median_fold_roi=0.95,
+        max_profit_concentration=0.55,
+    )
     rule,rstats=fit_current_selector(preds,lookback_days=180,min_bets=100)
     calibrator,cstats=fit_probability_calibrator(preds)
     ticket_calibrators,ticket_stats=fit_ticket_calibrators(preds)
@@ -205,10 +222,10 @@ if retrain_clicked:
         if m is None:
             rs.update(label='再学習に失敗しました',state='error');st.stop()
         save_pickle('models',m,{'version':MODEL_SNAPSHOT_VERSION,'scope':'full220'})
-        rs.write('③ 厳密なWalk-forward未見検証・確率校正を実行')
+        rs.write('③ 1日エンバーゴ付き厳格Walk-forward未見検証・確率校正を実行')
         assets=_build_learning_assets(full=True)
         save_pickle('learning_assets',assets,{'version':SNAPSHOT_VERSION,'mode':'full'})
-        state=_training_state_from_hist(h,added_races=int(h['race_id'].nunique()) if 'race_id' in h else 0,mode='full_retrain')
+        state=_training_state_from_hist(h,added_races=int(h['race_id'].nunique()) if 'race_id' in h else 0,mode='full_retrain_strict_oos_v2')
         save_pickle('training_state',state,{'version':'training-state-v1'})
         remove_pickle('bootstrap_assets')
         rs.write('④ 学習結果と学習状態を保存')
@@ -227,7 +244,7 @@ preds,selector_bt,selector_metrics,folds,gate,current_rule,current_stats,calibra
 base_stats=summarize(preds)
 temporal_stats=temporal_profit_summary(selector_bt)
 if gate.get('oos_bets',0)==0:
-    st.warning('未見利益検証は未実施です。「最新結果で再学習」を1回実行すると、厳密な未見検証を保存します。0.0%を実績値としては扱いません。')
+    st.warning('③厳格未見利益検証は未実施です。「完全再学習＋未見検証」を1回実行すると、1日エンバーゴ付きの検証結果を保存します。0.0%を実績値としては扱いません。')
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 st.caption(f'起動モード：予測モデル={model_source} / 学習検証={learning_source}。保存済み学習が無い場合も即時起動し、実戦ゲートは必ずロックされます。')
 
@@ -265,6 +282,13 @@ with st.expander('学習状況・券種別信頼度・条件別弱点（詳細�
     c.metric('校正サンプル',f"{cal_stats.get('samples',0):,}")
     d.metric('未見検証',f"{gate['oos_bets']:,}/200" if gate.get('oos_bets',0)>0 else '未実施')
     e.metric('未見回収率',f"{gate['oos_roi']*100:.1f}%" if gate.get('oos_bets',0)>0 else '未実施')
+    if gate.get('oos_bets',0)>0:
+        q1,q2,q3,q4=st.columns(4)
+        q1.metric('未見期間黒字率',f"{gate.get('positive_fold_ratio',0)*100:.1f}%")
+        q2.metric('中央値回収率',f"{gate.get('median_fold_roi',0)*100:.1f}%")
+        q3.metric('最大利益偏り',f"{gate.get('profit_concentration',1)*100:.1f}%")
+        q4.metric('最大ドローダウン',f"{gate.get('max_drawdown_yen',0):,.0f}円")
+        st.caption('③厳格未見検証：各テスト期間の直前1日を学習から除外し、ルール選定は必ず過去期間だけで行います。総回収率だけでなく、期間黒字率・中央値・利益偏り・直近安定性も実戦ゲートに使用します。')
     if cal_stats.get('brier_raw') is not None:
         delta=cal_stats['brier_raw']-cal_stats['brier_cal']
         st.caption(f"確率校正 Brier: 校正前 {cal_stats['brier_raw']:.4f} → 校正後 {cal_stats['brier_cal']:.4f}（改善 {delta:+.4f}）")
