@@ -14,23 +14,24 @@ from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 from src.persistence import save_pickle,load_pickle,remove_pickle,export_learning_snapshot,import_learning_snapshot,cache_file_exists
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3a'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3b'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
 SNAPSHOT_VERSION='v2132-assets-1'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
-st.set_page_config(page_title='BOAT RACE AI v2.13.3a',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.13.3b',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.3a：①学習スナップショット保存・復元（契約不要の確実保存）')
+st.caption('v2.13.3b：①保存・復元＋②新規結果の増分モデル更新')
 now=pd.Timestamp.now(tz=JST)
 
-c1,c2,c3=st.columns([3.2,1,1.35])
+c1,c2,c3,c4=st.columns([2.7,1,1.25,1.45])
 c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
 if c2.button('当日データ・オッズ更新',use_container_width=True):
     st.rerun()
-retrain_clicked=c3.button('最新結果で再学習',use_container_width=True,type='secondary')
+incremental_clicked=c3.button('新規結果だけモデル更新',use_container_width=True,type='secondary')
+retrain_clicked=c4.button('完全再学習＋未見検証',use_container_width=True,type='secondary')
 
 
 with st.expander('① 学習スナップショットの保存・復元', expanded=False):
-    st.caption('Streamlit Community Cloudのローカル保存は再起動後まで残る保証がないため、学習済み状態をZIPとしてPCに保存します。次回は同じZIPをアップロードして復元できます。')
+    st.caption('Streamlit Community Cloudのローカル保存は再起動後まで残る保証がないため、学習済み状態をZIPとしてPCに保存します。次回は同じZIPをアップロードして復元できます。v2.13.3bではモデルの増分学習状態も一緒に保存します。')
     snap_bytes = export_learning_snapshot()
     a1, a2 = st.columns(2)
     if snap_bytes:
@@ -70,6 +71,38 @@ def _recent_hist(h,days=120):
     if not d.notna().any():return x
     cutoff=d.max()-pd.Timedelta(days=int(days)-1)
     return x[d>=cutoff].copy()
+
+
+def _training_state_from_hist(h, added_races=0, mode='model_update'):
+    ids=[]
+    if h is not None and not h.empty and 'race_id' in h:
+        ids=sorted(set(h['race_id'].dropna().astype(str)))
+    latest='—'
+    if h is not None and not h.empty and 'race_date' in h:
+        d=pd.to_datetime(h['race_date'],errors='coerce')
+        if d.notna().any():
+            latest=str(d.max().date())
+    return {
+        'seen_race_ids': ids,
+        'learned_races': len(ids),
+        'last_result_date': latest,
+        'added_races': int(added_races),
+        'updated_at': str(pd.Timestamp.now(tz=JST)),
+        'mode': mode,
+    }
+
+def _get_training_state():
+    snap=load_pickle('training_state',max_age_hours=None,required_version=None)
+    if snap is None or not isinstance(snap.get('value'),dict):
+        return {}
+    return snap['value']
+
+def _new_result_ids(h,state):
+    if h is None or h.empty or 'race_id' not in h:
+        return set()
+    current=set(h['race_id'].dropna().astype(str))
+    seen=set((state or {}).get('seen_race_ids') or [])
+    return current-seen
 
 @st.cache_resource(ttl=21600,show_spinner='保存済み予測モデルを読み込んでいます…')
 def load_models_cached():
@@ -117,6 +150,51 @@ def load_learning_assets_cached():
         return snap['value'], 'full', '保存済み厳密検証'
     return _empty_learning_assets(),'none','未実施（即時起動）'
 
+
+if incremental_clicked:
+    with st.status('新しく確定した結果だけを確認しています…',expanded=True) as rs:
+        st.cache_data.clear()
+        h=load_hist()
+        old_state=_get_training_state()
+        new_ids=_new_result_ids(h,old_state)
+        old_model=load_pickle('models',max_age_hours=None,required_version=MODEL_SNAPSHOT_VERSION)
+
+        if old_model is None:
+            rs.write('保存済みモデルがないため、直近180日だけで初回モデルを作成します')
+            train=_recent_hist(h,180)
+            m=fit_models(train)
+            if m is None:
+                rs.update(label='モデル作成に失敗しました',state='error')
+                st.stop()
+            added=int(h['race_id'].nunique()) if 'race_id' in h else 0
+            save_pickle('models',m,{'version':MODEL_SNAPSHOT_VERSION,'scope':'recent180','update_mode':'bootstrap'})
+            state=_training_state_from_hist(h,added_races=added,mode='bootstrap_recent180')
+            save_pickle('training_state',state,{'version':'training-state-v1'})
+            rs.update(label=f'初回モデル作成完了：{state["learned_races"]:,}レースを記録',state='complete')
+        elif not new_ids:
+            state=old_state or _training_state_from_hist(h,0,'no_change')
+            state=dict(state); state['added_races']=0; state['updated_at']=str(pd.Timestamp.now(tz=JST)); state['mode']='no_change'
+            save_pickle('training_state',state,{'version':'training-state-v1'})
+            rs.update(label='新しい確定レースはありません。モデル再計算を省略しました',state='complete')
+        else:
+            rs.write(f'新規確定レースを {len(new_ids):,}件検出')
+            rs.write('直近180日を使って、最近の傾向を重視したモデルだけ再適合します')
+            # The underlying estimator is not online/partial_fit capable.
+            # Operational incremental learning therefore detects only new results,
+            # then performs one bounded rolling-window refit instead of replaying
+            # all 34k+ historical races or strict OOS validation.
+            train=_recent_hist(h,180)
+            m=fit_models(train)
+            if m is None:
+                rs.update(label='増分モデル更新に失敗しました',state='error')
+                st.stop()
+            save_pickle('models',m,{'version':MODEL_SNAPSHOT_VERSION,'scope':'recent180','update_mode':'incremental_refit','added_races':len(new_ids)})
+            state=_training_state_from_hist(h,added_races=len(new_ids),mode='incremental_recent180')
+            save_pickle('training_state',state,{'version':'training-state-v1'})
+            rs.update(label=f'増分モデル更新完了：新規 {len(new_ids):,}レース',state='complete')
+    st.cache_resource.clear()
+    st.rerun()
+
 if retrain_clicked:
     with st.status('長期再学習を実行しています。通常更新ではこの処理は走りません…',expanded=True) as rs:
         rs.write('① 220日分の公開結果を確認')
@@ -130,8 +208,10 @@ if retrain_clicked:
         rs.write('③ 厳密なWalk-forward未見検証・確率校正を実行')
         assets=_build_learning_assets(full=True)
         save_pickle('learning_assets',assets,{'version':SNAPSHOT_VERSION,'mode':'full'})
+        state=_training_state_from_hist(h,added_races=int(h['race_id'].nunique()) if 'race_id' in h else 0,mode='full_retrain')
+        save_pickle('training_state',state,{'version':'training-state-v1'})
         remove_pickle('bootstrap_assets')
-        rs.write('④ 学習結果を保存')
+        rs.write('④ 学習結果と学習状態を保存')
         rs.update(label='再学習完了。上部の「学習スナップショットをPCへ保存」で必ずバックアップしてください',state='complete')
     st.cache_resource.clear()
     st.rerun()
@@ -150,6 +230,15 @@ if gate.get('oos_bets',0)==0:
     st.warning('未見利益検証は未実施です。「最新結果で再学習」を1回実行すると、厳密な未見検証を保存します。0.0%を実績値としては扱いません。')
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 st.caption(f'起動モード：予測モデル={model_source} / 学習検証={learning_source}。保存済み学習が無い場合も即時起動し、実戦ゲートは必ずロックされます。')
+
+training_state=_get_training_state()
+if training_state:
+    t1,t2,t3,t4=st.columns(4)
+    t1.metric('保存済みモデル学習件数',f"{int(training_state.get('learned_races',0)):,}")
+    t2.metric('今回追加学習',f"{int(training_state.get('added_races',0)):,}")
+    t3.metric('モデル最新結果日',training_state.get('last_result_date','—'))
+    upd=str(training_state.get('updated_at','—'))
+    t4.metric('モデル更新',upd[:16].replace('T',' ') if upd!='—' else '—')
 
 if learning_mode=='none':
     st.info('高速起動モード：保存済み学習がまだありません。参考予想は表示できますが、実戦の「買い」は出ません。時間のある時に上部の「最新結果で再学習」を1回実行してください。')
