@@ -52,7 +52,7 @@ def cache_file_exists(name: str) -> bool:
     return _path(name).exists()
 
 
-def export_learning_snapshot(names=('models', 'learning_assets', 'training_state')) -> bytes | None:
+def export_learning_snapshot(names=('models', 'learning_assets', 'training_state', 'retrain_checkpoint', 'oos_partial')) -> bytes | None:
     """Export runtime learning cache as a portable ZIP kept by the user."""
     import io, json, zipfile
     files = []
@@ -76,7 +76,7 @@ def export_learning_snapshot(names=('models', 'learning_assets', 'training_state
     return bio.getvalue()
 
 
-def import_learning_snapshot(data: bytes, allowed_names=('models', 'learning_assets', 'training_state')) -> dict:
+def import_learning_snapshot(data: bytes, allowed_names=('models', 'learning_assets', 'training_state', 'retrain_checkpoint', 'oos_partial')) -> dict:
     """Restore a user-owned learning snapshot into the runtime cache."""
     import io, json, zipfile
     result = {'restored': [], 'errors': []}

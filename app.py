@@ -6,7 +6,7 @@ import streamlit as st
 
 from src.data import fetch_today,flatten,historical_dataset,fetch_results_for_dates
 from src.model import fit_models,trifecta_table,selection_signals,race_data_quality
-from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize,temporal_profit_summary,strict_nested_selector_backtest,deployment_gate_strict,strict_oos_diagnostics
+from src.backtest import generate_walk_forward_predictions,nested_selector_backtest,deployment_gate,fit_current_selector,current_buy_score,summarize,temporal_profit_summary,strict_nested_selector_backtest,deployment_gate_strict,strict_oos_diagnostics,walk_forward_plan,generate_walk_forward_prediction_fold
 from src.calibration import fit_probability_calibrator,calibrate_distribution,fit_ticket_calibrators,calibrate_ticket_table,ticket_reliability_gate
 from src.tickets import probability_tables_from_trifecta,merge_odds,choose_ticket_candidates,priority_candidate,TICKET_NAMES
 from src.context_reliability import fit_context_reliability,current_race_context,context_factor,apply_context_factor,apply_market_overlay
@@ -14,12 +14,12 @@ from src.odds import fetch_all_ticket_odds
 from src.ledger import load_ledger,save_ledger,upsert_predictions,apply_results
 from src.persistence import save_pickle,load_pickle,remove_pickle,export_learning_snapshot,import_learning_snapshot,cache_file_exists
 
-JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3c'
+JST=ZoneInfo('Asia/Tokyo'); APP_VERSION='v2.13.3d'
 DIRECT_REFRESH_MINUTES=30; MIN_EV=1.10
 SNAPSHOT_VERSION='v2133c-assets-strict-oos-2'; MODEL_SNAPSHOT_VERSION='v2132-model-1'
-st.set_page_config(page_title='BOAT RACE AI v2.13.3c',layout='wide')
+st.set_page_config(page_title='BOAT RACE AI v2.13.3d',layout='wide')
 st.title('BOAT RACE AI 購入判断ダッシュボード')
-st.caption('v2.13.3c：①保存・復元＋②増分学習＋③厳格な未見検証')
+st.caption('v2.13.3d：①保存・復元＋②増分学習＋③厳格未見検証＋④分割・再開可能な高速化')
 now=pd.Timestamp.now(tz=JST)
 
 c1,c2,c3,c4=st.columns([2.7,1,1.25,1.45])
@@ -27,11 +27,11 @@ c1.write(f'現在時刻：**{now:%Y/%m/%d %H:%M:%S}**')
 if c2.button('当日データ・オッズ更新',use_container_width=True):
     st.rerun()
 incremental_clicked=c3.button('新規結果だけモデル更新',use_container_width=True,type='secondary')
-retrain_clicked=c4.button('完全再学習＋未見検証',use_container_width=True,type='secondary')
+retrain_clicked=c4.button('完全再学習を1段階進める',use_container_width=True,type='secondary')
 
 
 with st.expander('① 学習スナップショットの保存・復元', expanded=False):
-    st.caption('Streamlit Community Cloudのローカル保存は再起動後まで残る保証がないため、学習済み状態をZIPとしてPCに保存します。次回は同じZIPをアップロードして復元できます。v2.13.3bではモデルの増分学習状態も一緒に保存します。')
+    st.caption('Streamlit Community Cloudのローカル保存は再起動後まで残る保証がないため、学習済み状態をZIPとしてPCに保存します。次回は同じZIPをアップロードして復元できます。v2.13.3dではモデル状態に加え、完全再学習の途中経過もスナップショットへ含めます。')
     snap_bytes = export_learning_snapshot()
     a1, a2 = st.columns(2)
     if snap_bytes:
@@ -213,23 +213,155 @@ if incremental_clicked:
     st.rerun()
 
 if retrain_clicked:
-    with st.status('長期再学習を実行しています。通常更新ではこの処理は走りません…',expanded=True) as rs:
-        rs.write('① 220日分の公開結果を確認')
+    with st.status('完全再学習を1段階だけ進めています…',expanded=True) as rs:
         st.cache_data.clear()
         h=load_hist()
-        rs.write('② 予測モデルを再学習')
-        m=fit_models(_recent_hist(h,180))
-        if m is None:
-            rs.update(label='再学習に失敗しました',state='error');st.stop()
-        save_pickle('models',m,{'version':MODEL_SNAPSHOT_VERSION,'scope':'full220'})
-        rs.write('③ 1日エンバーゴ付き厳格Walk-forward未見検証・確率校正を実行')
-        assets=_build_learning_assets(full=True)
-        save_pickle('learning_assets',assets,{'version':SNAPSHOT_VERSION,'mode':'full'})
-        state=_training_state_from_hist(h,added_races=int(h['race_id'].nunique()) if 'race_id' in h else 0,mode='full_retrain_strict_oos_v2')
-        save_pickle('training_state',state,{'version':'training-state-v1'})
-        remove_pickle('bootstrap_assets')
-        rs.write('④ 学習結果と学習状態を保存')
-        rs.update(label='再学習完了。上部の「学習スナップショットをPCへ保存」で必ずバックアップしてください',state='complete')
+        checkpoint_snap=load_pickle('retrain_checkpoint',max_age_hours=None,required_version=None)
+        checkpoint=checkpoint_snap['value'] if checkpoint_snap and isinstance(checkpoint_snap.get('value'),dict) else {}
+
+        current_latest=str(h['race_date'].dropna().max()) if (h is not None and not h.empty and 'race_date' in h) else '—'
+        current_count=int(h['race_id'].nunique()) if (h is not None and not h.empty and 'race_id' in h) else 0
+
+        # If the underlying result dataset changed, restart the staged validation
+        # so partial folds from different snapshots can never be mixed.
+        if checkpoint and (
+            checkpoint.get('data_latest') != current_latest
+            or int(checkpoint.get('data_races',-1)) != current_count
+        ):
+            rs.write('公開結果が更新されたため、古い途中経過を破棄して最初から再開します')
+            remove_pickle('retrain_checkpoint')
+            remove_pickle('oos_partial')
+            checkpoint={}
+
+        if not checkpoint:
+            rs.write('段階1/6：現在モデル（直近180日）を更新')
+            m=fit_models(_recent_hist(h,180))
+            if m is None:
+                rs.update(label='段階1：モデル再学習に失敗しました',state='error')
+                st.stop()
+            save_pickle('models',m,{'version':MODEL_SNAPSHOT_VERSION,'scope':'recent180','update_mode':'staged_full'})
+            plan=walk_forward_plan(h,min_train_days=35,test_days=28,max_test_days=112)
+            if not plan:
+                rs.update(label='未見検証の分割計画を作成できませんでした',state='error')
+                st.stop()
+            checkpoint={
+                'stage':'oos',
+                'next_fold':0,
+                'total_folds':len(plan),
+                'data_latest':current_latest,
+                'data_races':current_count,
+                'started_at':str(pd.Timestamp.now(tz=JST)),
+                'updated_at':str(pd.Timestamp.now(tz=JST)),
+            }
+            save_pickle('retrain_checkpoint',checkpoint,{'version':'staged-retrain-v1'})
+            remove_pickle('oos_partial')
+            rs.update(
+                label=f'段階1/6 完了。未見検証は{len(plan)}分割です。もう一度ボタンを押すと第1分割へ進みます',
+                state='complete'
+            )
+
+        elif checkpoint.get('stage')=='oos':
+            fold_i=int(checkpoint.get('next_fold',0))
+            total=int(checkpoint.get('total_folds',0))
+            if fold_i >= total:
+                checkpoint['stage']='assets'
+                checkpoint['updated_at']=str(pd.Timestamp.now(tz=JST))
+                save_pickle('retrain_checkpoint',checkpoint,{'version':'staged-retrain-v1'})
+                rs.update(label='未見予測分割は完了済みです。もう一度押すと最終集計へ進みます',state='complete')
+            else:
+                rs.write(f'段階{fold_i+2}/{total+2}：未見予測 分割 {fold_i+1}/{total}')
+                fold_df,meta=generate_walk_forward_prediction_fold(
+                    h,
+                    fold_index=fold_i,
+                    min_train_days=35,
+                    test_days=28,
+                    max_test_days=112,
+                )
+                if meta.get('error'):
+                    rs.update(label=f'分割{fold_i+1}で停止：{meta.get("error")}',state='error')
+                    st.stop()
+
+                partial_snap=load_pickle('oos_partial',max_age_hours=None,required_version=None)
+                partial=partial_snap['value'] if partial_snap is not None else pd.DataFrame()
+                if partial is None or not isinstance(partial,pd.DataFrame):
+                    partial=pd.DataFrame()
+
+                merged=pd.concat([partial,fold_df],ignore_index=True) if len(partial) else fold_df.copy()
+                if not merged.empty and 'race_id' in merged:
+                    merged=merged.drop_duplicates(subset=['race_id'],keep='last')
+                save_pickle('oos_partial',merged,{'version':'oos-partial-v1','fold_done':fold_i})
+
+                checkpoint['next_fold']=fold_i+1
+                checkpoint['updated_at']=str(pd.Timestamp.now(tz=JST))
+                if checkpoint['next_fold']>=total:
+                    checkpoint['stage']='assets'
+                save_pickle('retrain_checkpoint',checkpoint,{'version':'staged-retrain-v1'})
+
+                rs.write(f"検証期間：{meta.get('test_start')} ～ {meta.get('test_end')}")
+                rs.write(f"今回の未見予測：{len(fold_df):,}レース / 累計：{len(merged):,}レース")
+                if checkpoint['stage']=='assets':
+                    rs.update(label='全分割の未見予測が完了。もう一度押すと最終集計・保存へ進みます',state='complete')
+                else:
+                    rs.update(
+                        label=f'分割 {fold_i+1}/{total} 完了。次回は分割 {fold_i+2}/{total} から再開します',
+                        state='complete'
+                    )
+
+        elif checkpoint.get('stage')=='assets':
+            rs.write('最終段階：過去期間だけで購入ルールを選び、校正・厳格ゲートを集計')
+            partial_snap=load_pickle('oos_partial',max_age_hours=None,required_version=None)
+            preds=partial_snap['value'] if partial_snap is not None else pd.DataFrame()
+            if preds is None or not isinstance(preds,pd.DataFrame) or preds.empty:
+                rs.update(label='途中保存された未見予測が見つかりません',state='error')
+                st.stop()
+
+            selected,metrics,folds=strict_nested_selector_backtest(
+                preds,
+                lookback_days=56,
+                step_days=7,
+                min_bets=80,
+                min_selector_days=56,
+                embargo_days=1,
+            )
+            gate=deployment_gate_strict(
+                metrics,
+                folds,
+                selected=selected,
+                min_oos_bets=200,
+                min_oos_roi=1.00,
+                min_positive_fold_ratio=0.55,
+                min_recent_fold_ratio=0.50,
+                min_median_fold_roi=0.95,
+                max_profit_concentration=0.55,
+            )
+            rule,rstats=fit_current_selector(preds,lookback_days=180,min_bets=100)
+            calibrator,cstats=fit_probability_calibrator(preds)
+            ticket_calibrators,ticket_stats=fit_ticket_calibrators(preds)
+            ticket_gate=ticket_reliability_gate(ticket_stats,min_samples=200)
+            context_stats=fit_context_reliability(preds,min_samples=25)
+
+            assets=(preds,selected,metrics,folds,gate,rule,rstats,calibrator,cstats,
+                    ticket_calibrators,ticket_stats,ticket_gate,context_stats)
+            save_pickle('learning_assets',assets,{'version':SNAPSHOT_VERSION,'mode':'staged_full'})
+            state=_training_state_from_hist(
+                h,
+                added_races=current_count,
+                mode='full_retrain_strict_oos_v2_staged'
+            )
+            save_pickle('training_state',state,{'version':'training-state-v1'})
+            remove_pickle('bootstrap_assets')
+            remove_pickle('retrain_checkpoint')
+            remove_pickle('oos_partial')
+            rs.update(
+                label='完全再学習・厳格未見検証が完了しました。学習スナップショットをPCへ保存してください',
+                state='complete'
+            )
+
+        else:
+            rs.write('途中状態が不明なため安全にリセットします')
+            remove_pickle('retrain_checkpoint')
+            remove_pickle('oos_partial')
+            rs.update(label='途中状態をリセットしました。もう一度押してください',state='complete')
     st.cache_resource.clear()
     st.rerun()
 
@@ -247,6 +379,16 @@ if gate.get('oos_bets',0)==0:
     st.warning('③厳格未見利益検証は未実施です。「完全再学習＋未見検証」を1回実行すると、1日エンバーゴ付きの検証結果を保存します。0.0%を実績値としては扱いません。')
 latest_date=str(hist['race_date'].dropna().max()) if not hist.empty else '—'
 st.caption(f'起動モード：予測モデル={model_source} / 学習検証={learning_source}。保存済み学習が無い場合も即時起動し、実戦ゲートは必ずロックされます。')
+
+retrain_cp_snap=load_pickle('retrain_checkpoint',max_age_hours=None,required_version=None)
+retrain_cp=retrain_cp_snap['value'] if retrain_cp_snap and isinstance(retrain_cp_snap.get('value'),dict) else {}
+if retrain_cp:
+    stage=retrain_cp.get('stage')
+    if stage=='oos':
+        done=int(retrain_cp.get('next_fold',0)); total=int(retrain_cp.get('total_folds',0))
+        st.info(f'④ 分割再学習の途中経過を保存済み：未見予測 {done}/{total} 分割完了。次回は続きから再開します。')
+    elif stage=='assets':
+        st.info('④ 分割再学習：未見予測は全分割完了。次は最終集計・校正・ゲート保存です。')
 
 training_state=_get_training_state()
 if training_state:

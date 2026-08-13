@@ -623,3 +623,154 @@ def deployment_gate_strict(
         "valid_folds": diag["valid_folds"],
         "validation_version": "strict-oos-v2",
     }
+
+
+def walk_forward_plan(hist, min_train_days=35, test_days=28, max_test_days=112):
+    """Return a deterministic plan for resumable walk-forward validation."""
+    if hist is None or hist.empty:
+        return []
+    h = hist.copy()
+    h["race_date_dt"] = pd.to_datetime(h["race_date"], errors="coerce")
+    h = h[h["race_date_dt"].notna() & h["finish_num"].notna()].copy()
+    dates = sorted(h["race_date_dt"].dt.normalize().drop_duplicates())
+    if len(dates) < min_train_days + 7:
+        return []
+
+    test_dates = dates[-min(max_test_days, len(dates)-min_train_days):]
+    plan = []
+    for start_i in range(0, len(test_dates), test_days):
+        window = test_dates[start_i:start_i+test_days]
+        if not window:
+            continue
+        plan.append({
+            "fold_index": len(plan),
+            "test_start": str(pd.Timestamp(window[0]).date()),
+            "test_end": str(pd.Timestamp(window[-1]).date()),
+            "window_dates": [str(pd.Timestamp(x).date()) for x in window],
+        })
+    return plan
+
+
+def generate_walk_forward_prediction_fold(
+    hist,
+    fold_index,
+    min_train_days=35,
+    test_days=28,
+    max_test_days=112,
+):
+    """Generate exactly one walk-forward fold for resumable validation.
+
+    The fold model uses only race dates strictly earlier than the fold test
+    window. This function deliberately performs only one model fit per call.
+    """
+    if hist is None or hist.empty:
+        return pd.DataFrame(), {"error": "empty_history"}
+
+    h = hist.copy()
+    h["race_date_dt"] = pd.to_datetime(h["race_date"], errors="coerce")
+    h = h[h["race_date_dt"].notna() & h["finish_num"].notna()].copy()
+    dates = sorted(h["race_date_dt"].dt.normalize().drop_duplicates())
+    if len(dates) < min_train_days + 7:
+        return pd.DataFrame(), {"error": "insufficient_dates"}
+
+    test_dates = dates[-min(max_test_days, len(dates)-min_train_days):]
+    windows = [test_dates[i:i+test_days] for i in range(0, len(test_dates), test_days)]
+    windows = [w for w in windows if w]
+    if fold_index < 0 or fold_index >= len(windows):
+        return pd.DataFrame(), {"error": "fold_out_of_range", "total_folds": len(windows)}
+
+    window = windows[fold_index]
+    cutoff = window[0]
+    train = h[h["race_date_dt"] < cutoff]
+    test = h[h["race_date_dt"].dt.normalize().isin(window)]
+
+    meta = {
+        "fold_index": int(fold_index),
+        "total_folds": int(len(windows)),
+        "test_start": str(pd.Timestamp(window[0]).date()),
+        "test_end": str(pd.Timestamp(window[-1]).date()),
+        "train_races": int(train["race_id"].nunique()) if "race_id" in train else 0,
+        "test_races": int(test["race_id"].nunique()) if "race_id" in test else 0,
+    }
+    if meta["train_races"] < 300:
+        meta["error"] = "insufficient_train_races"
+        return pd.DataFrame(), meta
+
+    models = fit_models(train)
+    if models is None:
+        meta["error"] = "fit_failed"
+        return pd.DataFrame(), meta
+
+    rows = []
+    for rid, g in test.groupby("race_id"):
+        actual = g["trifecta_result"].dropna()
+        payout = pd.to_numeric(g["trifecta_payout"], errors="coerce").dropna()
+        if not len(actual):
+            continue
+        try:
+            tri = trifecta_table(models, g)
+            top = tri.iloc[0]
+            sig = selection_signals(tri)
+            pred = str(top["combo"])
+            act = str(actual.iloc[0])
+            hit = pred == act
+            pay = float(payout.iloc[0]) if len(payout) else 0.0
+            ticket_tables = probability_tables_from_trifecta(tri)
+            aa = tuple(int(x) for x in act.split("-"))
+            actual_map = {
+                "3t": act,
+                "3f": "-".join(map(str, sorted(aa))),
+                "2t": f"{aa[0]}-{aa[1]}",
+                "2f": "-".join(map(str, sorted(aa[:2]))),
+            }
+            lane1_first_prob = float(
+                tri.loc[tri["combo"].astype(str).str.startswith("1-"), "prob"].sum()
+            )
+
+            def _first_num(col):
+                try:
+                    return float(pd.to_numeric(g[col], errors="coerce").dropna().iloc[0])
+                except Exception:
+                    return None
+
+            context_extra = {
+                "lane1_first_prob": lane1_first_prob,
+                "wind_speed": _first_num("wind_speed"),
+                "wave_height_cm": _first_num("wave_height_cm"),
+            }
+            ticket_extra = {}
+            for code, tdf in ticket_tables.items():
+                if tdf is None or tdf.empty:
+                    continue
+                tt = tdf.iloc[0]
+                tpred = str(tt["combo"])
+                ticket_extra[f"{code}_pred"] = tpred
+                ticket_extra[f"{code}_prob"] = float(tt["prob"])
+                ticket_extra[f"{code}_hit"] = bool(tpred == actual_map[code])
+
+            rows.append({
+                "race_id": rid,
+                "race_date": str(g["race_date"].iloc[0])[:10],
+                "venue": g["venue"].iloc[0],
+                "stadium_no": int(g["stadium_no"].iloc[0]),
+                "race_no": int(g["race_no"].iloc[0]),
+                "pred": pred,
+                "prob": float(top["prob"]),
+                "prob_margin": float(sig["prob_margin"]),
+                "confidence": float(sig["confidence"]),
+                "first_lane": sig["first_lane"],
+                "actual": act,
+                "hit": bool(hit),
+                "payout": pay,
+                "stake": 100.0,
+                "return_yen": pay if hit else 0.0,
+                "profit_yen": (pay if hit else 0.0) - 100.0,
+                **context_extra,
+                **ticket_extra,
+            })
+        except Exception:
+            pass
+
+    out = pd.DataFrame(rows)
+    meta["prediction_rows"] = int(len(out))
+    return out, meta
